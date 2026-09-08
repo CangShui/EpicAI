@@ -32,6 +32,11 @@ async function boot() {
   const root = document.getElementById('app');
   root.innerHTML = '';
 
+  const urlParams = new URLSearchParams(location.search);
+  if (urlParams.get('token')) {
+    localStorage.setItem('epicai_token', urlParams.get('token'));
+  }
+
   const token = localStorage.getItem('epicai_token');
   if (token) {
     try {

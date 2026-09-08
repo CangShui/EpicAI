@@ -1,0 +1,6 @@
+*.log
+data/*.db*
+data/storage/
+logs/*.log
+epicai
+epicai.exe
