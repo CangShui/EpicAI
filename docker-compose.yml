@@ -1,0 +1,18 @@
+services:
+  epicai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: epicai:latest
+    container_name: epicai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - EPICAI_HOST=0.0.0.0
+      - EPICAI_PORT=8000
+      - EPICAI_DATABASE_URL=sqlite:data/epicai.db
+      - EPICAI_STORAGE_PATH=data/storage
+    restart: unless-stopped
