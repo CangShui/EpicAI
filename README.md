@@ -6,10 +6,12 @@ EpicAI 不运行任何真实大模型，而是完整复刻 OpenAI API 的协议�
 
 ---
 直接调用：
+```
 curl -N http://epicai.adomain.eu.org/v1/responses \
   -H "Authorization: Bearer test" \
   -H "Content-Type: application/json" \
   -d '{"model":"epic-alpha","input":"Responses Test","stream":true}'
+```
 ---
 
 ## 核心能力
