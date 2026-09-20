@@ -5,6 +5,12 @@
 EpicAI 不运行任何真实大模型，而是完整复刻 OpenAI API 的协议行为，用于调试 AI 客户端、Agent、网关、SDK、重试组件与前端聊天程序。它可以在毫秒级启动、无成本地产生**可控、可复现**的流式响应、错误与网络异常。
 
 ---
+直接调用：
+curl -N http://epicai.adomain.eu.org/v1/responses \
+  -H "Authorization: Bearer test" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"epic-alpha","input":"Responses Test","stream":true}'
+---
 
 ## 核心能力
 
