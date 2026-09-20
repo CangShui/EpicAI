@@ -24,7 +24,6 @@ import (
 	"github.com/epicai/epicai/backend/internal/config"
 	"github.com/epicai/epicai/backend/internal/engine/echo"
 	"github.com/epicai/epicai/backend/internal/engine/fault"
-	"github.com/epicai/epicai/backend/internal/engine/scenario"
 	"github.com/epicai/epicai/backend/internal/engine/stream"
 	"github.com/epicai/epicai/backend/internal/events"
 	"github.com/epicai/epicai/backend/internal/sessions"
@@ -58,6 +57,10 @@ type AssetPutResult struct {
 	SHA256   string
 	MimeType string
 }
+
+// agentCycleClock paces the gap between consecutive agent echo cycles across
+// tool-call turns. Keyed by model + original user input.
+var agentCycleClock sync.Map // string -> time.Time
 
 type Server struct {
 	deps Deps
@@ -420,11 +423,8 @@ func (r *streamRunner) Run(ctx context.Context, model *storage.Model) {
 		ses.PublishState()
 		r.runManualOnly(ctx)
 		return
-	case storage.BehaviorScenario:
-		r.runScenario(ctx, model)
-		return
-	case storage.BehaviorFiniteEcho:
-		r.runEcho(ctx, model, true)
+	case storage.BehaviorInfiniteEchoMax:
+		r.runEchoMax(ctx, model)
 		return
 	default:
 		r.runEcho(ctx, model, false)
@@ -457,25 +457,404 @@ func (r *streamRunner) runManualOnly(ctx context.Context) {
 			if done := r.handleCommand(ctx, cmd); done {
 				return
 			}
+		case text := <-r.ses.ManualInput():
+			r.deliverManual(ctx, text)
 		}
 	}
 }
 
-func (r *streamRunner) runScenario(ctx context.Context, model *storage.Model) {
-	sc, err := r.srv.deps.Store.GetScenario(context.Background(), model.ScenarioID)
-	if err != nil || sc == nil {
-		r.runEcho(ctx, model, false)
+// runAgentEcho executes infinite or multi-turn tool calling for agent loops.
+func (r *streamRunner) runAgentEcho(ctx context.Context, model *storage.Model, maxMode bool) {
+	ses := r.ses
+	ses.SetMode(storage.ModeEcho)
+	ses.SetState(storage.StateEchoing)
+	ses.PublishState()
+
+	// Tool names and the output budget were captured from the full request at
+	// session creation (before any storage truncation).
+	availableTools := ses.RequestTools()
+	requestMaxTokens := ses.RequestMaxTokens()
+
+	userText := r.conv.LastUserText()
+
+	// If this request IS the model call of an EpicAI-spawned subagent, do a
+	// single shell echo instead of spawning more subagents. Without this guard
+	// each subagent would spawn N more, recursively, until the client cancels.
+	if echo.IsSubagentEchoRequest(userText) {
+		r.runSubagentEcho(ctx, model, userText)
 		return
 	}
-	r.ses.SetState(storage.StateEchoing)
-	r.ses.SetMode(storage.ModeScenario)
-	runner := scenario.New(r.ses, r.sw, sc.Steps, r.conv)
-	_ = runner.Run(ctx)
-	r.ses.Close(storage.StateEnded, "scenario_complete")
+
+	subCount := model.SubagentCount
+	if subCount <= 0 {
+		subCount = 1
+	}
+
+	// Build the aggregated echo text block ONCE. Both the streamed assistant
+	// text and the subagent echo arguments use this exact same block, and each
+	// loop cycle emits it only once.
+	//
+	// The output budget for one cycle is roughly (1 + subCount) blocks: the
+	// streamed text plus one tool call per subagent, each carrying the block in
+	// its arguments. Cap the per-block tokens so the WHOLE cycle stays within
+	// the client's max_tokens; otherwise the client truncates the response and
+	// never receives finish_reason=tool_calls, so it cannot start the next cycle.
+	blockTokens := 0
+	if maxMode {
+		blockTokens = model.MaxTokenChunk
+		if blockTokens <= 0 {
+			blockTokens = 2048
+		}
+		if requestMaxTokens > 0 {
+			budget := requestMaxTokens / (1 + subCount)
+			if budget < 1 {
+				budget = 1
+			}
+			if blockTokens > budget {
+				blockTokens = budget
+			}
+		}
+	}
+
+	var echoText string
+	if maxMode {
+		echoText = echo.BuildInfiniteMaxText(userText, blockTokens)
+	} else {
+		echoText = userText
+	}
+	// The subagent shell/task call echoes the same aggregated block.
+	spec := echo.BuildAgentEchoCall(availableTools, echoText)
+	modeName := "无限回显"
+	if maxMode {
+		modeName = "无限回显MAX"
+	}
+	interval := echoInterval(ses)
+
+	var n int64
+	for {
+		// 1. Admin commands have priority.
+		select {
+		case cmd := <-ses.Commands():
+			if done := r.handleCommand(ctx, cmd); done {
+				return
+			}
+			if ses.State() == storage.StateManual {
+				if done := r.runManualPhase(ctx); done {
+					return
+				}
+			}
+			continue
+		default:
+		}
+
+		// 2. Wait while paused (connection stays open).
+		if ses.State() == storage.StatePaused {
+			select {
+			case cmd := <-ses.Commands():
+				if done := r.handleCommand(ctx, cmd); done {
+					return
+				}
+			case <-ctx.Done():
+				ses.Close(storage.StateClientDisconnected, "client_disconnected")
+				return
+			case <-ses.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
+		// 3. Pace each cycle by the echo interval. The gap is measured across
+		// tool-call turns (each agent cycle is one client turn), so cycles are
+		// spaced by the configured interval regardless of client speed.
+		if interval > 0 {
+			key := model.ModelID + "\x00" + userText
+			if v, ok := agentCycleClock.Load(key); ok {
+				if last, ok := v.(time.Time); ok {
+					if wait := time.Until(last.Add(interval)); wait > 0 {
+						select {
+						case <-time.After(wait):
+						case <-ctx.Done():
+							ses.Close(storage.StateClientDisconnected, "client_disconnected")
+							return
+						case <-ses.Done():
+							return
+						}
+					}
+				}
+			}
+			agentCycleClock.Store(key, time.Now())
+		}
+
+		// 4. One cycle: emit the Agent Tool Call(s) and the aggregated text
+		// together, once each. Tool calls are sent first so the client can begin
+		// the subagent(s) while the text continues to stream.
+		for i := 0; i < subCount; i++ {
+			callID := fmt.Sprintf("call_epic_%s_%d_%d", ses.ID[len(ses.ID)-6:], n, i)
+			if ses.Streaming {
+				_ = r.sw.EmitToolCall(ctx, i, callID, spec.ToolName, spec.Arguments)
+			}
+		}
+
+		if echoText != "" {
+			if ses.Streaming {
+				runes := []rune(echoText)
+				chunkSize := 80
+				for i := 0; i < len(runes); i += chunkSize {
+					select {
+					case <-ctx.Done():
+						ses.Close(storage.StateClientDisconnected, "client_disconnected")
+						return
+					case <-ses.Done():
+						return
+					default:
+					}
+					end := i + chunkSize
+					if end > len(runes) {
+						end = len(runes)
+					}
+					part := string(runes[i:end])
+					toks := tokenizer.Count(part)
+					if b := ses.Bucket(); b != nil {
+						if !b.Wait(ctx, toks) {
+							ses.Close(storage.StateClientDisconnected, "client_disconnected")
+							return
+						}
+					}
+					ses.AddOutputTokens(toks)
+					if err := r.emit(ctx, part); err != nil {
+						ses.Close(storage.StateClientDisconnected, "client_disconnected")
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				toks := tokenizer.Count(echoText)
+				ses.AddOutputTokens(toks)
+			}
+			r.srv.logOutput(ses, echoText, tokenizer.Count(echoText))
+		}
+
+		vlog.BizEntry(ses.RequestID, "Agent工具调用与聚合吐字回显",
+			fmt.Sprintf("模式: %s, 本轮吐字: %d 字符, 下发工具: %s x %d, 轮次: %d", modeName, len(echoText), spec.ToolName, subCount, n+1), spec.Arguments)
+		r.srv.deps.Bus.Publish(events.Message{
+			Type: events.ChunkSent, Session: ses.ID,
+			Data: map[string]any{
+				"echo_count":     n + 1,
+				"tokens":         tokenizer.Count(echoText),
+				"tool":           spec.ToolName,
+				"subagent":       spec.Subagent,
+				"subagent_count": subCount,
+				"mode":           func() string { if maxMode { return "infinite_echo_max" }; return "infinite_echo" }(),
+			},
+		})
+
+		ses.AddEcho()
+		n++
+
+		// 5. Close this cycle's turn with finish_reason=tool_calls so the client
+		// executes the subagent(s) and re-requests: that request begins the next
+		// cycle, which is paced by the echo interval above.
+		if ses.Streaming {
+			_ = r.finish(ctx, "tool_calls")
+		}
+		ses.Close(storage.StateEnded, "agent_cycle_complete")
+		return
+	}
+}
+
+// runSubagentEcho handles the model call made BY an EpicAI subagent. It runs
+// exactly one shell echo of the payload (the aggregated block), then reports
+// the echoed text and stops. This terminates the subagent without recursion.
+func (r *streamRunner) runSubagentEcho(ctx context.Context, model *storage.Model, userText string) {
+	ses := r.ses
+	ses.SetMode(storage.ModeEcho)
+	ses.SetState(storage.StateEchoing)
+	ses.PublishState()
+
+	block := echo.ExtractEchoPayload(userText)
+	if strings.TrimSpace(block) == "" {
+		block = userText
+	}
+
+	// Has the subagent already executed the shell echo? If so, report the echoed
+	// block as assistant text and finish the subagent cleanly.
+	hasToolResult := false
+	for _, m := range r.conv.Messages {
+		if m.Role == canonical.RoleTool {
+			hasToolResult = true
+			break
+		}
+	}
+
+	if hasToolResult {
+		tokens := tokenizer.Count(block)
+		ses.AddOutputTokens(tokens)
+		if ses.Streaming {
+			_ = r.emit(ctx, block)
+		}
+		r.srv.logOutput(ses, block, tokens)
+		ses.AddEcho()
+		if ses.Streaming {
+			_ = r.finish(ctx, "stop")
+		}
+		ses.Close(storage.StateEnded, "subagent_echo_complete")
+		return
+	}
+
+	// First subagent call: dispatch exactly one shell echo carrying the block.
+	tool, argKey := echo.PickShellTool(ses.RequestTools())
+	payload := strings.ReplaceAll(block, `"`, `\"`)
+	args := `{"` + argKey + `":"echo \"` + payload + `\""}`
+	if ses.Streaming {
+		_ = r.sw.EmitToolCall(ctx, 0, "call_epic_sub_echo", tool, args)
+		_ = r.finish(ctx, "tool_calls")
+	}
+	tokens := tokenizer.Count(args)
+	ses.AddOutputTokens(tokens)
+	ses.AddEcho()
+	r.srv.logOutput(ses, args, tokens)
+	vlog.BizEntry(ses.RequestID, "子代理Shell回显", fmt.Sprintf("子代理下发单次Shell echo: %s, 块长度: %d 字符", tool, len(block)), "")
+	r.srv.deps.Bus.Publish(events.Message{
+		Type: events.ChunkSent, Session: ses.ID,
+		Data: map[string]any{"echo_count": 1, "tool": tool, "subagent": true},
+	})
+	ses.Close(storage.StateEnded, "subagent_shell_emitted")
+}
+
+// runEchoMax executes Infinite Echo MAX: aggregates repeated user text into large token chunks for stress testing.
+func (r *streamRunner) runEchoMax(ctx context.Context, model *storage.Model) {
+	// Agent tool-call mode only applies when the client declared tools. Requests
+	// without tools (e.g. opencode's context summarizer) must get plain text.
+	if model.EnableAgent && len(r.ses.RequestTools()) > 0 {
+		r.runAgentEcho(ctx, model, true)
+		return
+	}
+
+	ses := r.ses
+	ses.SetMode(storage.ModeEcho)
+	ses.SetState(storage.StateEchoing)
+	ses.PublishState()
+
+	maxTok := model.MaxTokenChunk
+	if maxTok <= 0 {
+		maxTok = 2048
+	}
+
+	userText := r.conv.LastUserText()
+	aggText := echo.BuildInfiniteMaxText(userText, maxTok)
+	chunkTokens := tokenizer.Count(aggText)
+
+	initInterval := echoInterval(ses)
+	if initInterval <= 0 {
+		initInterval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(initInterval)
+	defer ticker.Stop()
+
+	var n int64
+	for {
+		select {
+		case cmd := <-ses.Commands():
+			if done := r.handleCommand(ctx, cmd); done {
+				return
+			}
+			if ses.State() == storage.StateManual {
+				if done := r.runManualPhase(ctx); done {
+					return
+				}
+				if iv := echoInterval(ses); iv > 0 {
+					ticker.Reset(iv)
+				}
+			}
+			continue
+		default:
+		}
+
+		if ses.State() == storage.StatePaused {
+			select {
+			case cmd := <-ses.Commands():
+				if done := r.handleCommand(ctx, cmd); done {
+					return
+				}
+			case <-ctx.Done():
+				ses.Close(storage.StateClientDisconnected, "client_disconnected")
+				return
+			case <-ses.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
+		if b := ses.Bucket(); b != nil {
+			if !b.Wait(ctx, chunkTokens) {
+				ses.Close(storage.StateClientDisconnected, "client_disconnected")
+				return
+			}
+		}
+		ses.AddOutputTokens(chunkTokens)
+		if err := r.emit(ctx, aggText); err != nil {
+			ses.Close(storage.StateClientDisconnected, "client_disconnected")
+			return
+		}
+		r.srv.logOutput(ses, aggText, chunkTokens)
+		r.srv.deps.Bus.Publish(events.Message{
+			Type: events.ChunkSent, Session: ses.ID,
+			Data: map[string]any{"echo_count": n + 1, "tokens": chunkTokens, "mode": "infinite_echo_max"},
+		})
+
+		ses.AddEcho()
+		n++
+
+		// Honour max_tokens only for tool-less utility calls (e.g. the client's
+		// context summarizer) so they terminate. Normal echo/agent requests keep
+		// looping endlessly by design.
+		if mt := ses.RequestMaxTokens(); mt > 0 && len(ses.RequestTools()) == 0 && ses.OutputTokens() >= int64(mt) {
+			if ses.Streaming {
+				_ = r.finish(ctx, "length")
+			}
+			ses.Close(storage.StateEnded, "max_tokens_reached")
+			return
+		}
+
+		// Delay interval
+		iv := echoInterval(ses)
+		if iv <= 0 {
+			runtime.Gosched()
+			time.Sleep(100 * time.Microsecond)
+			continue
+		}
+		ticker.Reset(iv)
+		select {
+		case cmd := <-ses.Commands():
+			if done := r.handleCommand(ctx, cmd); done {
+				return
+			}
+			if ses.State() == storage.StateManual {
+				if done := r.runManualPhase(ctx); done {
+					return
+				}
+			}
+		case <-ctx.Done():
+			ses.Close(storage.StateClientDisconnected, "client_disconnected")
+			return
+		case <-ses.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // runEcho is the infinite (or finite) echo loop: the core EpicAI behavior.
 func (r *streamRunner) runEcho(ctx context.Context, model *storage.Model, finite bool) {
+	// Agent tool-call mode only applies when the client declared tools. Requests
+	// without tools (e.g. opencode's context summarizer) must get plain text.
+	if model.EnableAgent && len(r.ses.RequestTools()) > 0 {
+		r.runAgentEcho(ctx, model, false)
+		return
+	}
+
 	ses := r.ses
 	ses.SetMode(storage.ModeEcho)
 	ses.SetState(storage.StateEchoing)
@@ -549,6 +928,16 @@ func (r *streamRunner) runEcho(ctx context.Context, model *storage.Model, finite
 		}
 		ses.AddEcho()
 		n++
+
+		// 3b. Honour max_tokens only for tool-less utility calls (e.g. the
+		// client's context summarizer); normal echo keeps looping endlessly.
+		if mt := ses.RequestMaxTokens(); mt > 0 && len(ses.RequestTools()) == 0 && ses.OutputTokens() >= int64(mt) {
+			if ses.Streaming {
+				_ = r.finish(ctx, "length")
+			}
+			ses.Close(storage.StateEnded, "max_tokens_reached")
+			return
+		}
 
 		// 4. Finite echo ends normally after maxEcho.
 		if finite && model.MaxEchoCount > 0 && n >= int64(model.MaxEchoCount) {

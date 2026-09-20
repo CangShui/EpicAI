@@ -8,38 +8,45 @@ export async function sessionsPage(ctx) {
   const filters = { q: '', model: '', protocol: '', state: '', ip: '', active: '' };
 
   const toolbar = el('div', { class: 'toolbar' });
-  const q = el('input', { type: 'text', placeholder: 'Search session / model / IP' });
+  const q = el('input', { type: 'text', placeholder: '搜索会话 ID / 模型 / IP' });
   const modelSel = el('select');
-  modelSel.appendChild(el('option', { value: '' }, 'All models'));
+  modelSel.appendChild(el('option', { value: '' }, '全部模型'));
   const protoSel = el('select');
-  protoSel.appendChild(el('option', { value: '' }, 'All protocols'));
+  protoSel.appendChild(el('option', { value: '' }, '全部协议'));
   protoSel.appendChild(el('option', { value: 'chat.completions' }, 'chat.completions'));
   protoSel.appendChild(el('option', { value: 'responses' }, 'responses'));
   const stateSel = el('select');
-  stateSel.appendChild(el('option', { value: '' }, 'All states'));
-  ['CONNECTED', 'ECHOING', 'PAUSED', 'MANUAL', 'ERROR_PENDING', 'ENDED', 'CLIENT_DISCONNECTED']
-    .forEach(s => stateSel.appendChild(el('option', { value: s }, s)));
-  const ipIn = el('input', { type: 'text', placeholder: 'Client IP' });
+  stateSel.appendChild(el('option', { value: '' }, '全部状态'));
+  [
+    ['CONNECTED', '已连接'],
+    ['ECHOING', '回显中 (Echoing)'],
+    ['PAUSED', '已暂停'],
+    ['MANUAL', '人工接管中'],
+    ['ERROR_PENDING', '等待注入错误'],
+    ['ENDED', '已结束'],
+    ['CLIENT_DISCONNECTED', '客户端已断开']
+  ].forEach(([s, l]) => stateSel.appendChild(el('option', { value: s }, l)));
+  const ipIn = el('input', { type: 'text', placeholder: '客户端 IP' });
   const activeOnly = el('input', { type: 'checkbox' });
-  const refreshBtn = el('button', { class: 'btn btn-sm' }, 'Refresh');
+  const refreshBtn = el('button', { class: 'btn btn-sm' }, '刷新');
 
   toolbar.appendChild(q);
   toolbar.appendChild(modelSel);
   toolbar.appendChild(protoSel);
   toolbar.appendChild(stateSel);
   toolbar.appendChild(ipIn);
-  toolbar.appendChild(el('label', { class: 'row', style: 'gap:5px;font-size:12.5px' }, activeOnly, ' Active only'));
+  toolbar.appendChild(el('label', { class: 'row', style: 'gap:5px;font-size:12.5px' }, activeOnly, ' 仅活跃会话'));
   toolbar.appendChild(refreshBtn);
 
-  const c = card('Sessions', { tight: true });
+  const c = card('会话列表', { tight: true });
   const wrap = el('div', { class: 'table-wrap' });
   const table = el('table');
   wrap.appendChild(table);
   c.body.appendChild(wrap);
 
   const pager = el('div', { class: 'row', style: 'margin-top:10px;justify-content:flex-end;gap:8px' });
-  const prevBtn = el('button', { class: 'btn btn-sm' }, 'Prev');
-  const nextBtn = el('button', { class: 'btn btn-sm' }, 'Next');
+  const prevBtn = el('button', { class: 'btn btn-sm' }, '上一页');
+  const nextBtn = el('button', { class: 'btn btn-sm' }, '下一页');
   const pageInfo = el('span', { class: 'dim', style: 'font-size:12.5px' }, '');
   pager.appendChild(pageInfo); pager.appendChild(prevBtn); pager.appendChild(nextBtn);
 
@@ -67,14 +74,14 @@ export async function sessionsPage(ctx) {
       });
       const list = res.sessions || [];
       render(list);
-      pageInfo.textContent = `${offset + 1}–${offset + list.length} of ${res.total}`;
+      pageInfo.textContent = `第 ${offset + 1}–${offset + list.length} 条，共 ${res.total} 条`;
       prevBtn.disabled = offset <= 0;
       nextBtn.disabled = offset + list.length >= res.total;
       const badge = document.querySelector('[data-live]');
       if (badge) badge.textContent = String(res.total);
     } catch (e) {
       table.innerHTML = '';
-      table.appendChild(el('tbody', {}, el('tr', {}, el('td', {}, 'Failed to load: ' + e.message))));
+      table.appendChild(el('tbody', {}, el('tr', {}, el('td', {}, '加载会话失败: ' + e.message))));
     }
   }
 
@@ -82,13 +89,13 @@ export async function sessionsPage(ctx) {
     clear(table);
     const thead = el('thead');
     const hr = el('tr');
-    ['Session', 'Model', 'Protocol', 'Client', 'Started', 'Mode', 'State', 'Echo', 'Bytes Out', 'Rate', '']
-      .forEach((h, i) => hr.appendChild(el('th', { class: i >= 7 ? 'num' : '' }, h)));
+    ['会话 ID', '模型', '协议', '客户端 IP', '开始时间', '运行模式', '当前状态', '回显轮次', '已发送流量', '速率 (tok/s)', '操作']
+      .forEach((h, i) => hr.appendChild(el('th', { class: i >= 7 && i <= 9 ? 'num' : '' }, h)));
     thead.appendChild(hr);
     table.appendChild(thead);
     const tbody = el('tbody');
     if (!list.length) {
-      tbody.appendChild(el('tr', {}, el('td', { colspan: '11' }, emptyBox('No sessions yet. Start one with the curl command on the Dashboard.'))));
+      tbody.appendChild(el('tr', {}, el('td', { colspan: '11' }, emptyBox('暂无会话。可在终端执行 curl 命令开始测试。'))));
       table.appendChild(tbody);
       return;
     }
@@ -105,7 +112,7 @@ export async function sessionsPage(ctx) {
       tr.appendChild(el('td', { class: 'num mono' }, fmtNum(s.echo_count)));
       tr.appendChild(el('td', { class: 'num mono' }, fmtBytes(s.bytes_out)));
       tr.appendChild(el('td', { class: 'num mono' }, fmtRate(s.current_rate)));
-      const open = el('a', { class: 'btn btn-xs', href: `#/admin/sessions/${s.session_id}` }, 'Open');
+      const open = el('a', { class: 'btn btn-xs', href: `#/admin/sessions/${s.session_id}` }, '进入会话');
       tr.appendChild(el('td', {}, open));
       tbody.appendChild(tr);
     }

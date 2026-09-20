@@ -1,0 +1,2778 @@
+# EpicAI 项目开发任务书
+
+## 1. 项目名称
+
+**EpicAI — OpenAI Compatible AI Endpoint Simulator**
+
+项目定位：面向 AI 客户端、Agent、网关、中间件、SDK、重试组件和前端聊天程序的 **OpenAI 兼容接口模拟器 / 故障注入平台 / 人工会话接管平台**。
+
+EpicAI 本身不需要运行真实大语言模型。
+
+默认提供一个模型：
+
+`epic-alpha`
+
+该模型的核心行为不是推理，而是：
+
+> 客户端发送什么，服务器就持续不断地重复返回什么，直到客户端主动断开、管理员结束会话，或管理员注入指定错误。
+
+---
+
+# 2. 项目目标
+
+EpicAI 需要解决以下测试需求：
+
+1. 测试客户端是否兼容 OpenAI 风格 API。
+2. 测试客户端是否能正确处理长时间 Streaming。
+3. 测试客户端面对永不自然结束的模型时的行为。
+4. 测试客户端主动取消请求的行为。
+5. 测试客户端超时机制。
+6. 测试客户端 Token/内容无限增长情况下的处理。
+7. 测试客户端收到 400、401、403、404、408、409、413、422、429、500、502、503、504 等错误时的行为。
+8. 测试客户端收到自定义错误代码、自定义 JSON、自定义错误信息时的行为。
+9. 测试客户端遇到流式响应中途报错时的行为。
+10. 测试客户端处理文字、图片、文件以及混合多模态内容的能力。
+11. 允许后台管理员随时人工接管某次 AI 对话。
+12. 允许管理员模拟模型回复、延迟、卡死、断流、异常结束等各种情况。
+13. 允许动态创建、删除、启用、禁用模型。
+14. 所有行为可以通过 Web 管理后台进行操作。
+
+---
+
+# 3. 核心设计原则
+
+## 3.1 不运行真实 AI
+
+EpicAI 不调用任何真正的大语言模型。
+
+所有输出由以下模块产生：
+
+* Echo Engine
+* Scenario Engine
+* Manual Takeover Engine
+* Fault Injection Engine
+
+---
+
+## 3.2 OpenAI 协议适配层
+
+内部必须建立统一的 Canonical Message/Event Model。
+
+不同接口首先解析成统一内部结构：
+
+```text
+OpenAI Chat Completions
+        ↓
+OpenAI Responses
+        ↓
+Legacy Completions
+        ↓
+Files / multimodal input
+        ↓
+Canonical Conversation
+        ↓
+Echo / Manual / Fault Engine
+        ↓
+Protocol Adapter
+        ↓
+对应 OpenAI 风格响应
+```
+
+禁止针对每个接口分别实现一套完全独立的会话逻辑。
+
+---
+
+# 4. 第一阶段必须兼容的 OpenAI 接口
+
+## 4.1 Models
+
+必须实现：
+
+```http
+GET /v1/models
+```
+
+返回后台当前启用的模型。
+
+以及：
+
+```http
+GET /v1/models/{model}
+```
+
+默认必须存在：
+
+```text
+epic-alpha
+```
+
+模型列表不得写死在代码中。
+
+必须可以通过后台：
+
+* 新建模型
+* 修改模型名称
+* 修改显示名称
+* 启用
+* 禁用
+* 删除
+* 克隆
+* 设置默认行为
+
+---
+
+# 5. Chat Completions API
+
+必须实现：
+
+```http
+POST /v1/chat/completions
+```
+
+兼容至少以下字段：
+
+```json
+{
+  "model": "epic-alpha",
+  "messages": [],
+  "stream": true,
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 1000,
+  "max_completion_tokens": 1000,
+  "stop": null,
+  "n": 1,
+  "user": "test"
+}
+```
+
+对于不影响 EpicAI 行为的 OpenAI 参数：
+
+原则上应：
+
+> 接受并忽略，而不是因为未使用这些参数而报错。
+
+后台日志需要记录原始 request body。
+
+---
+
+# 6. Responses API
+
+必须实现：
+
+```http
+POST /v1/responses
+```
+
+至少兼容：
+
+```json
+{
+  "model": "epic-alpha",
+  "input": "...",
+  "stream": true
+}
+```
+
+同时支持结构化 input：
+
+```json
+{
+  "model": "epic-alpha",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "hello"
+        }
+      ]
+    }
+  ]
+}
+```
+
+必须支持：
+
+* input_text
+* input_image
+* file/file_id 类输入
+* 多段 content
+* 多轮 conversation input
+
+---
+
+# 7. Files API
+
+为了测试多模态客户端，至少实现：
+
+```http
+POST /v1/files
+GET /v1/files/{file_id}
+GET /v1/files/{file_id}/content
+DELETE /v1/files/{file_id}
+```
+
+文件上传后生成：
+
+```text
+file_epic_xxxxxxxxx
+```
+
+文件需要存储：
+
+* file_id
+* filename
+* MIME Type
+* size
+* SHA256
+* upload_time
+* binary content
+* associated session
+* uploader API key
+
+后台必须能够查看文件元数据。
+
+对于图片文件，应支持后台预览。
+
+---
+
+# 8. 默认模型 epic-alpha 行为
+
+## 8.1 文字 Echo
+
+客户端：
+
+```text
+你好
+```
+
+模型开始不断返回：
+
+```text
+你好
+你好
+你好
+你好
+你好
+你好
+……
+```
+
+不能自动结束。
+
+---
+
+# 9. 流式响应
+
+`epic-alpha` 的标准无限模式必须优先通过 Streaming 实现。
+
+Chat Completions：
+
+```text
+Content-Type: text/event-stream
+```
+
+服务器持续返回合法 SSE Chunk。
+
+示意：
+
+```text
+data: {"id":"chatcmpl_xxx","object":"chat.completion.chunk",...}
+
+data: {"id":"chatcmpl_xxx","object":"chat.completion.chunk",...}
+
+data: {"id":"chatcmpl_xxx","object":"chat.completion.chunk",...}
+```
+
+正常 Infinite Echo 模式：
+
+**永远不要主动发送 `[DONE]`。**
+
+只有出现以下事件才结束：
+
+* 客户端断开
+* 管理员 Stop
+* 管理员 Inject Error
+* 会话被系统策略终止
+* 服务器关闭
+
+---
+
+# 10. 非流式请求
+
+OpenAI 标准非流式响应无法合法表达“无限个完整响应”。
+
+因此系统必须区分：
+
+### Strict Compatibility Mode
+
+当：
+
+```json
+"stream": false
+```
+
+时返回一次完整 Echo。
+
+这是默认行为。
+
+### Chaos Infinite Non-stream Mode
+
+管理员可启用：
+
+```text
+Hold Connection Forever
+```
+
+此模式故意保持 HTTP 请求不完成，用于测试客户端：
+
+* timeout
+* abort
+* connection handling
+
+必须在管理后台明显标记：
+
+```text
+NON-STANDARD / CHAOS MODE
+```
+
+防止将其误认为标准 OpenAI 行为。
+
+---
+
+# 11. Echo 轮次
+
+默认：
+
+```text
+echo_interval_ms = 500
+```
+
+可配置范围：
+
+```text
+0 ～ 任意正整数
+```
+
+例如：
+
+```text
+0ms
+10ms
+100ms
+500ms
+1000ms
+5000ms
+30000ms
+```
+
+后台支持会话级动态修改。
+
+修改后无需重建连接。
+
+---
+
+# 12. Echo 内容规则
+
+假设用户输入：
+
+```text
+ABC
+```
+
+则：
+
+```text
+ABCABCABCABCABC...
+```
+
+或者按照 message 单位：
+
+```text
+ABC
+ABC
+ABC
+ABC
+```
+
+具体模式后台可选：
+
+* exact
+* line
+* message
+* block
+
+默认：
+
+```text
+message
+```
+
+---
+
+# 13. 多模态 Echo
+
+客户端可以发送：
+
+* 文字
+* 图片 URL
+* Base64 图片
+* file_id
+* 文件
+* 文字 + 图片
+* 文字 + 文件
+* 文字 + 图片 + 文件
+* 多张图片
+* 多个文件
+
+EpicAI 内部必须完整保存原始 Content Parts。
+
+例如：
+
+```text
+TEXT
+IMAGE
+FILE
+IMAGE
+TEXT
+```
+
+不得只提取文字后丢弃其他内容。
+
+---
+
+# 14. 图片回显
+
+需要提供两种兼容模式。
+
+## Strict OpenAI Mode
+
+在当前协议无法直接合法返回原始 image input 类型时：
+
+服务器将图片保存到 EpicAI Asset Store，并产生：
+
+```text
+/epic-assets/{asset_id}
+```
+
+输出中通过当前协议允许的内容形式返回图片 URL。
+
+对于支持 Markdown 的客户端，例如：
+
+```markdown
+![epic echo](https://server/epic-assets/xxx)
+```
+
+客户端因此可以实际显示原图片。
+
+---
+
+## Relaxed Multimodal Mirror Mode
+
+提供可选：
+
+```text
+Relaxed OpenAI Compatible
+```
+
+允许按照输入 content part 的结构直接 Mirror：
+
+```json
+[
+  {
+    "type": "image_url",
+    "image_url": {
+      "url": "..."
+    }
+  }
+]
+```
+
+该模式用于测试各种“OpenAI-compatible”第三方客户端。
+
+后台必须明确标记该模式可能包含非官方扩展。
+
+---
+
+# 15. 文件回显
+
+文件不得每轮重新上传。
+
+第一次请求：
+
+```text
+文件 → Asset/File Store
+```
+
+之后每个 Echo 周期只发送：
+
+* file_id
+* URL
+* filename
+* MIME
+* metadata
+
+避免无限复制实际文件造成磁盘爆炸。
+
+管理员可以配置：
+
+```text
+repeat_file_reference
+repeat_download_url
+repeat_metadata
+```
+
+---
+
+# 16. 会话系统
+
+每个请求建立：
+
+```text
+session_id
+```
+
+格式例如：
+
+```text
+sess_epic_01HXXXXXXX
+```
+
+后台实时显示。
+
+会话状态：
+
+```text
+CONNECTED
+ECHOING
+PAUSED
+MANUAL
+ERROR_PENDING
+ENDING
+ENDED
+CLIENT_DISCONNECTED
+```
+
+---
+
+# 17. 会话列表后台
+
+后台首页显示：
+
+| Session  | Model      | API       | Client  | Started | Mode | State   |
+| -------- | ---------- | --------- | ------- | ------- | ---- | ------- |
+| sess_xxx | epic-alpha | responses | 1.2.3.4 | 12:10   | Echo | ECHOING |
+
+支持：
+
+* 搜索 session
+* 按模型过滤
+* 按 API 类型过滤
+* 按状态过滤
+* 按 IP 过滤
+* 按 API Key 过滤
+* 按时间过滤
+
+---
+
+# 18. 会话详情页面
+
+打开某次会话，应看到：
+
+### Client Request
+
+显示：
+
+```text
+HTTP Method
+Path
+Headers
+Body
+Model
+Streaming
+IP
+User-Agent
+API Key fingerprint
+Connect time
+```
+
+Authorization 不允许直接显示完整 Key。
+
+例如：
+
+```text
+sk-****F8A2
+```
+
+---
+
+### Conversation
+
+实时看到：
+
+```text
+USER
+你好
+
+EPIC-ALPHA
+你好
+
+EPIC-ALPHA
+你好
+
+EPIC-ALPHA
+你好
+```
+
+内容实时刷新。
+
+禁止后台页面因为无限输出无限增加 DOM 最终卡死。
+
+必须实现：
+
+* 虚拟列表
+  或
+* 只展示最近 N 条
+
+例如：
+
+```text
+Last 1000 events
+```
+
+完整日志写入存储。
+
+---
+
+# 19. 人工接管
+
+这是 EpicAI 的核心功能之一。
+
+会话页面提供：
+
+```text
+TAKE OVER
+```
+
+管理员点击后：
+
+```text
+ECHOING → MANUAL
+```
+
+Echo Engine 立即暂停。
+
+客户端连接保持不变。
+
+管理员出现输入框：
+
+```text
+Type a manual assistant response...
+```
+
+管理员输入：
+
+```text
+我是管理员，现在由人工接管。
+```
+
+客户端应立即收到：
+
+```text
+我是管理员，现在由人工接管。
+```
+
+---
+
+# 20. 人工回复模式
+
+人工回复支持：
+
+```text
+一次性完整回复
+流式逐字发送
+流式按块发送
+模拟打字
+```
+
+模拟打字速度：
+
+```text
+characters_per_second
+```
+
+后台可调整。
+
+---
+
+# 21. 退出人工接管
+
+提供：
+
+```text
+RETURN TO ECHO
+```
+
+状态：
+
+```text
+MANUAL → ECHOING
+```
+
+之后 epic-alpha 继续 Echo。
+
+---
+
+# 22. Pause
+
+提供：
+
+```text
+PAUSE OUTPUT
+```
+
+暂停发送任何数据，但：
+
+```text
+TCP/HTTP/SSE connection
+```
+
+仍然保持。
+
+用于模拟：
+
+> 模型突然卡住。
+
+提供：
+
+```text
+RESUME
+```
+
+继续输出。
+
+---
+
+# 23. 正常结束
+
+提供：
+
+```text
+FINISH NORMALLY
+```
+
+Chat Completions Streaming：
+
+返回合法 finish_reason。
+
+之后发送：
+
+```text
+data: [DONE]
+```
+
+Responses API：
+
+必须发送对应 completed event。
+
+---
+
+# 24. 强制断开
+
+提供：
+
+```text
+DROP CONNECTION
+```
+
+不发送正常结束事件。
+
+立即关闭 socket。
+
+用于测试：
+
+```text
+connection reset
+unexpected EOF
+stream interrupted
+```
+
+---
+
+# 25. 故障注入系统
+
+会话页面必须提供：
+
+```text
+INJECT ERROR
+```
+
+管理员可以填写：
+
+```text
+HTTP Status
+Error Code
+Error Type
+Error Message
+Raw JSON
+Delay
+Connection behavior
+```
+
+---
+
+# 26. 预设错误
+
+至少内置：
+
+```text
+400 Bad Request
+401 Unauthorized
+403 Forbidden
+404 Model Not Found
+408 Request Timeout
+409 Conflict
+413 Payload Too Large
+422 Unprocessable Entity
+429 Rate Limit
+500 Internal Server Error
+502 Bad Gateway
+503 Service Unavailable
+504 Gateway Timeout
+```
+
+---
+
+# 27. OpenAI 风格错误
+
+默认错误模板：
+
+```json
+{
+  "error": {
+    "message": "Rate limit exceeded",
+    "type": "rate_limit_error",
+    "param": null,
+    "code": "rate_limit_exceeded"
+  }
+}
+```
+
+所有字段允许修改。
+
+例如管理员输入：
+
+```text
+HTTP Status:
+429
+
+Code:
+6004
+
+Type:
+quota_exceeded
+
+Message:
+您的使用量已超出频率限制
+```
+
+可以返回：
+
+```json
+{
+  "error": {
+    "message": "您的使用量已超出频率限制",
+    "type": "quota_exceeded",
+    "param": null,
+    "code": 6004
+  }
+}
+```
+
+---
+
+# 28. Raw Error
+
+管理员允许完全自定义：
+
+```json
+{
+  "code": 429,
+  "message": "upstream 429",
+  "detail": {
+    "code": 6004,
+    "msg": "您的使用量已超出频率限制"
+  }
+}
+```
+
+选择：
+
+```text
+RAW RESPONSE
+```
+
+以后服务器必须原样返回。
+
+---
+
+# 29. 流中错误
+
+EpicAI 必须支持：
+
+```text
+正常输出 20 次
+↓
+管理员 Inject Error
+↓
+流异常结束
+```
+
+至少支持：
+
+### Mode A
+
+直接关闭连接。
+
+### Mode B
+
+在 SSE 中发送 Error Event。
+
+### Mode C
+
+最后发送 HTTP/协议可表达的错误。
+
+### Mode D
+
+发送 malformed chunk 后关闭。
+
+---
+
+# 30. 延迟错误
+
+允许：
+
+```text
+Error after:
+10 seconds
+```
+
+或者：
+
+```text
+Error after:
+100 chunks
+```
+
+例如：
+
+```text
+echo 100 次
+→ 429
+```
+
+---
+
+# 31. 自动场景
+
+除了人工操作，还需要 Scenario Engine。
+
+例如创建：
+
+```text
+429-after-10-chunks
+```
+
+内容：
+
+```text
+echo 10 chunks
+wait 500ms
+return 429
+```
+
+然后模型可绑定该 Scenario。
+
+---
+
+# 32. Scenario 建议支持的 Action
+
+至少支持：
+
+```text
+echo
+wait
+pause
+send_text
+send_asset
+send_raw_sse
+send_malformed_sse
+finish
+error
+disconnect
+loop
+```
+
+未来可以实现简单 JSON DSL。
+
+示例：
+
+```json
+{
+  "name": "429-after-20",
+  "steps": [
+    {
+      "action": "echo",
+      "count": 20,
+      "interval_ms": 100
+    },
+    {
+      "action": "error",
+      "http_status": 429,
+      "message": "Rate limit exceeded"
+    }
+  ]
+}
+```
+
+---
+
+# 33. 模型管理
+
+后台：
+
+```text
+Models
+```
+
+每个模型包含：
+
+```text
+model_id
+display_name
+enabled
+created_at
+behavior
+default_echo_interval
+protocol_mode
+scenario
+description
+metadata
+```
+
+允许创建：
+
+```text
+epic-alpha
+epic-beta
+gpt-test
+claude-test
+gemini-test
+whatever-model-name
+```
+
+这样可以测试客户端：
+
+> 是否允许未知模型名称。
+
+---
+
+# 34. 模型行为模式
+
+每个模型支持选择：
+
+```text
+Infinite Echo
+Finite Echo
+Manual Only
+Scenario
+Immediate Error
+Hang Forever
+Normal Static Response
+Connection Drop
+```
+
+---
+
+# 35. API Key
+
+EpicAI 必须支持：
+
+```http
+Authorization: Bearer xxx
+```
+
+至少提供：
+
+```text
+Accept Any Key
+Require Key
+Key Management
+```
+
+开发环境默认：
+
+```text
+Accept Any Non-empty Bearer Key
+```
+
+可以允许特殊配置：
+
+```text
+Allow Empty Key
+```
+
+---
+
+# 36. API Key 管理后台
+
+管理员可以：
+
+* 创建 Key
+* 禁用 Key
+* 删除 Key
+* 设置名称
+* 设置模型权限
+* 设置请求限制
+* 查看使用次数
+* 查看最后访问时间
+
+日志只保存：
+
+```text
+API key hash/fingerprint
+```
+
+禁止明文长期记录完整 API Key。
+
+---
+
+# 37. Dashboard
+
+后台首页显示：
+
+```text
+Active Sessions
+Total Requests
+Streaming Connections
+Manual Sessions
+Errors Injected
+Current Throughput
+Uploaded Assets
+Storage Usage
+```
+
+---
+
+# 38. 实时通信
+
+管理端与服务器推荐使用：
+
+```text
+WebSocket
+```
+
+后台需要实时收到：
+
+```text
+session.created
+session.updated
+input.received
+chunk.sent
+manual.takeover
+manual.message
+fault.injected
+session.closed
+```
+
+---
+
+# 39. 日志
+
+至少分：
+
+```text
+Access Log
+Conversation Log
+Admin Operation Log
+Error Log
+Protocol Log
+```
+
+管理员操作必须审计。
+
+例如：
+
+```text
+2026-09-08 12:00:10
+admin
+sess_xxx
+INJECT_ERROR
+429
+rate_limit_exceeded
+```
+
+---
+
+# 40. 原始协议查看
+
+后台会话页面必须允许切换：
+
+```text
+Friendly View
+Raw Request
+Raw Response
+Raw SSE
+```
+
+Raw SSE 对调试尤其重要。
+
+---
+
+# 41. 数据存储
+
+开发模式最低支持：
+
+```text
+SQLite
+```
+
+同时架构上不得强绑定 SQLite。
+
+生产可以支持：
+
+```text
+PostgreSQL
+```
+
+二进制文件使用独立：
+
+```text
+Asset Storage
+```
+
+存文件系统即可。
+
+---
+
+# 42. 防止无限 Echo 耗尽服务器
+
+虽然业务逻辑要求无限输出，但实现必须考虑资源控制。
+
+配置项至少包括：
+
+```text
+max_active_sessions
+max_sessions_per_ip
+max_file_size
+max_assets_size
+max_log_size
+max_events_per_session
+max_echo_rate
+```
+
+注意：
+
+这些是服务器保护措施，不代表会话自动“正常完成”。
+
+超过资源限制时应进入：
+
+```text
+RESOURCE_LIMIT
+```
+
+并按管理员配置选择：
+
+```text
+disconnect
+error
+pause
+```
+
+---
+
+# 43. 日志无限增长控制
+
+UI 可以只展示：
+
+```text
+最近 1000 个事件
+```
+
+数据库可以：
+
+* 分页
+* 滚动存储
+* 定期归档
+* 设置 retention days
+
+绝不能因为一个 Infinite Echo 会话最终撑爆浏览器内存。
+
+---
+
+# 44. 前端管理页面
+
+建议至少包含：
+
+```text
+/dashboard
+/sessions
+/sessions/{id}
+/models
+/scenarios
+/api-keys
+/files
+/logs
+/settings
+```
+
+---
+
+# 45. 会话控制栏
+
+会话详情顶部固定显示：
+
+```text
+[PAUSE]
+[RESUME]
+[TAKE OVER]
+[RETURN TO ECHO]
+[SEND]
+[FINISH]
+[INJECT ERROR]
+[DROP CONNECTION]
+```
+
+危险操作要求二次确认：
+
+```text
+DROP CONNECTION
+DELETE SESSION
+DELETE MODEL
+```
+
+---
+
+# 46. Session Inspector
+
+实时展示：
+
+```text
+Protocol
+Model
+Streaming
+Echo Count
+Bytes In
+Bytes Out
+Started At
+Duration
+Client IP
+User Agent
+Request ID
+Session ID
+State
+```
+
+---
+
+# 47. 网络调试信息
+
+每个请求产生：
+
+```text
+x-request-id
+```
+
+例如：
+
+```text
+req_epic_xxx
+```
+
+建议 Response Header：
+
+```http
+x-epic-session-id: sess_xxx
+x-request-id: req_xxx
+```
+
+方便客户端和后台对应。
+
+---
+
+# 48. CORS
+
+后台支持配置：
+
+```text
+Disabled
+Allow All
+Allow List
+```
+
+方便浏览器 AI 客户端直接测试。
+
+---
+
+# 49. Docker
+
+必须提供：
+
+```text
+Dockerfile
+docker-compose.yml
+```
+
+最低能够：
+
+```bash
+docker compose up -d
+```
+
+启动：
+
+```text
+EpicAI API
+EpicAI Admin
+Database
+```
+
+开发版允许 API + Admin 单容器。
+
+---
+
+# 50. 配置方式
+
+同时支持：
+
+```text
+.env
+后台 Settings
+```
+
+环境变量至少：
+
+```text
+EPICAI_HOST
+EPICAI_PORT
+EPICAI_ADMIN_PORT
+EPICAI_DATABASE_URL
+EPICAI_STORAGE_PATH
+EPICAI_ADMIN_USER
+EPICAI_ADMIN_PASSWORD
+EPICAI_ALLOW_ANY_KEY
+EPICAI_DEFAULT_MODEL
+EPICAI_LOG_LEVEL
+```
+
+---
+
+# 51. Health API
+
+必须提供：
+
+```http
+GET /health
+```
+
+返回：
+
+```json
+{
+  "status": "ok"
+}
+```
+
+以及：
+
+```http
+GET /ready
+```
+
+检测：
+
+* database
+* storage
+* event engine
+
+---
+
+# 52. 安全边界
+
+管理后台与 OpenAI API 必须逻辑隔离。
+
+例如：
+
+```text
+/v1/*
+```
+
+为客户端接口。
+
+```text
+/admin/*
+```
+
+为管理接口。
+
+管理 API 必须认证。
+
+客户端不得通过 OpenAI API：
+
+* 接管其他 Session
+* 查看其他请求
+* 修改模型
+* 注入其他 Session 错误
+
+---
+
+# 53. 第一阶段不要求
+
+第一阶段无需真正实现：
+
+* LLM inference
+* Embeddings 数学计算
+* Image Generation
+* Speech Recognition
+* TTS
+* Vector Database
+* RAG
+
+这些未来可扩展为模拟接口。
+
+---
+
+# 54. 代码质量要求
+
+代码必须做到：
+
+* API Adapter 与业务逻辑解耦
+* Echo Engine 独立
+* Fault Engine 独立
+* Session Manager 独立
+* Admin API 独立
+* Storage 抽象
+* 不允许核心逻辑全部堆在一个文件
+* 类型定义完整
+* 对公开 API 写自动测试
+
+---
+
+# 55. 建议目录
+
+```text
+epicai/
+├── backend/
+│   ├── api/
+│   │   ├── chat_completions
+│   │   ├── responses
+│   │   ├── models
+│   │   ├── files
+│   │   └── admin
+│   ├── adapters/
+│   │   ├── openai_chat
+│   │   └── openai_responses
+│   ├── engine/
+│   │   ├── echo
+│   │   ├── manual
+│   │   ├── scenario
+│   │   └── fault
+│   ├── sessions/
+│   ├── storage/
+│   ├── models/
+│   └── main
+│
+├── frontend/
+│   ├── dashboard
+│   ├── sessions
+│   ├── models
+│   ├── scenarios
+│   └── settings
+│
+├── tests/
+│   ├── protocol
+│   ├── streaming
+│   ├── multimodal
+│   ├── faults
+│   └── admin
+│
+├── docker/
+├── docs/
+└── docker-compose.yml
+```
+
+---
+
+# 56. 开发优先级
+
+## P0
+
+必须首先完成：
+
+```text
+/v1/models
+/v1/chat/completions
+/v1/responses
+Streaming
+epic-alpha Infinite Echo
+Session Manager
+Web Session Viewer
+Stop
+Manual Takeover
+Inject Error
+```
+
+没有以上功能不得认为项目 MVP 完成。
+
+## P1
+
+随后实现：
+
+```text
+File API
+Images
+Multimodal Echo
+Model Management
+Scenario Engine
+API Key Management
+Raw SSE Inspector
+```
+
+## P2
+
+最后实现：
+
+```text
+统计报表
+复杂 Scenario DSL
+日志归档
+PostgreSQL
+权限体系
+更多 OpenAI API 模拟
+```
+
+---
+
+# 57. MVP 完成定义
+
+只有同时满足以下条件才能称为 EpicAI MVP：
+
+客户端：
+
+```text
+OpenAI SDK
+        ↓
+EpicAI
+        ↓
+epic-alpha
+```
+
+发送：
+
+```text
+Hello
+```
+
+客户端开始持续：
+
+```text
+Hello
+Hello
+Hello
+Hello
+...
+```
+
+管理员打开后台能够看到该 Session。
+
+点击：
+
+```text
+TAKE OVER
+```
+
+输入：
+
+```text
+Human takeover test
+```
+
+客户端实时收到该内容。
+
+之后点击：
+
+```text
+RETURN TO ECHO
+```
+
+Echo 恢复。
+
+管理员再点击：
+
+```text
+INJECT ERROR
+```
+
+输入：
+
+```text
+HTTP 429
+code = 6004
+message = 使用量已超出频率限制
+```
+
+客户端按照设定方式结束本次请求。
+
+# 58. 输出速率限制系统
+
+EpicAI 必须实现完整的 **Token Rate Limiting / Throughput Simulation** 系统。
+
+其用途包括测试客户端面对：
+
+* 极慢模型
+* 正常模型
+* 超高速模型
+* 突发输出
+* 全局拥塞
+* 多会话抢占带宽
+* 单会话被限速
+* 并发达到上限
+
+时的行为。
+
+---
+
+# 59. Token/s 定义
+
+EpicAI 所有输出速率统一使用：
+
+```text
+token/s
+```
+
+即：
+
+```text
+Output Tokens Per Second
+```
+
+不得使用：
+
+```text
+chunks/s
+messages/s
+characters/s
+```
+
+代替。
+
+内部必须存在统一 Token Counter。
+
+建议默认采用与 OpenAI 常用模型兼容的 tokenizer 实现。
+
+如果无法精确获得目标模型 tokenizer，则 EpicAI 自己规定一个固定 Canonical Tokenizer，并在后台明确显示：
+
+```text
+Token accounting is based on EpicAI Canonical Tokenizer.
+```
+
+这样同一次测试在不同时间必须得到相同 token 数。
+
+---
+
+# 60. 无限制模式
+
+EpicAI 必须支持：
+
+```text
+Rate Limit:
+Unlimited
+```
+
+Unlimited 意味着：
+
+> Echo Engine 不主动等待，数据一旦生成立即向客户端输出，由 CPU、运行时、网络栈、TCP、TLS、HTTP/SSE、客户端读取速度和系统背压共同决定最终速度。
+
+代码中不得通过：
+
+```text
+sleep(0)
+sleep(1ms)
+固定 interval
+```
+
+人为限制 Unlimited 模式。
+
+---
+
+# 61. 无间隔模式不存在固定通用 token/s
+
+必须在项目文档明确说明：
+
+```text
+Unlimited ≠ 一个固定 token/s 数字
+```
+
+实际最大速率取决于：
+
+```text
+CPU
+Runtime
+JSON serialization
+SSE framing
+TLS
+Network bandwidth
+TCP backpressure
+Chunk size
+Tokenizer
+Client receive speed
+```
+
+理论网络上限可估算为：
+
+```text
+tokens_per_second ≈
+available_bytes_per_second /
+average_wire_bytes_per_token
+```
+
+例如纯文本极端理想情况：
+
+```text
+1 Gbps
+≈ 125,000,000 Byte/s
+
+假设：
+4 Byte/token
+
+则：
+125,000,000 / 4
+≈ 31,250,000 token/s
+```
+
+但该数字未包含：
+
+```text
+SSE
+JSON
+HTTP
+TCP
+TLS
+字段结构
+chunk framing
+```
+
+因此不能作为部署环境真实最大值。
+
+---
+
+# 62. Uncapped Benchmark
+
+EpicAI 必须实现：
+
+```text
+Uncapped Throughput Benchmark
+```
+
+用实际部署服务器测量：
+
+> 当前 EpicAI 在不进行 Rate Limit 时的可持续输出能力。
+
+管理后台：
+
+```text
+Settings
+→ Performance
+→ Run Uncapped Benchmark
+```
+
+测试必须使用真实：
+
+* Echo Engine
+* Tokenizer
+* Protocol Adapter
+* JSON Serialization
+* SSE Serialization
+
+建议至少测试：
+
+```text
+Chat Completions Streaming
+Responses Streaming
+```
+
+分别得到：
+
+```text
+Chat Completions:
+8,734,521 token/s
+
+Responses:
+7,912,330 token/s
+```
+
+同时计算推荐：
+
+```text
+Safe Maximum
+```
+
+例如：
+
+```text
+Safe Maximum =
+Benchmark P50 × 90%
+```
+
+或者直接记录一定持续时间内稳定吞吐。
+
+---
+
+# 63. Maximum Configurable Rate
+
+后台必须维护：
+
+```text
+Measured Maximum Token Rate
+```
+
+例如：
+
+```text
+8,734,521 token/s
+```
+
+之后速率配置控件允许：
+
+```text
+1
+～
+8,734,521 token/s
+```
+
+以及：
+
+```text
+Unlimited
+```
+
+管理员可以选择：
+
+```text
+1 token/s
+5 token/s
+10 token/s
+50 token/s
+100 token/s
+500 token/s
+1,000 token/s
+10,000 token/s
+100,000 token/s
+1,000,000 token/s
+Measured Maximum
+Unlimited
+```
+
+同时允许直接手工输入数字。
+
+---
+
+# 64. 全局 Token Rate Limit
+
+必须支持：
+
+```text
+Global Output Rate Limit
+```
+
+例如：
+
+```text
+Global:
+1000 token/s
+```
+
+表示：
+
+> EpicAI 所有当前会话合计，每秒最多发送约 1000 个 output token。
+
+例如同时存在：
+
+```text
+Session A
+Session B
+Session C
+Session D
+```
+
+总输出不得长期超过：
+
+```text
+1000 token/s
+```
+
+允许短时间出现非常小的调度误差，但长期平均必须符合限制。
+
+---
+
+# 65. 单会话 Token Rate Limit
+
+每个 Session 必须可以独立设置：
+
+```text
+Session Rate Limit
+```
+
+例如：
+
+```text
+Session A:
+10 token/s
+
+Session B:
+100 token/s
+
+Session C:
+Unlimited
+```
+
+管理员可以在会话运行过程中实时修改。
+
+例如：
+
+```text
+100 token/s
+↓
+1 token/s
+```
+
+客户端连接不得因此断开。
+
+输出应该立即逐渐降低到约：
+
+```text
+1 token/s
+```
+
+反过来：
+
+```text
+1
+↓
+1000 token/s
+```
+
+也无需重新建立连接。
+
+---
+
+# 66. Effective Rate
+
+一个会话实际输出速度必须满足：
+
+```text
+Effective Session Rate
+=
+min(
+    Session Rate Limit,
+    Global Scheduler Allocation,
+    Physical/Runtime Throughput
+)
+```
+
+如果以后加入 Model Rate Limit，则：
+
+```text
+Effective Session Rate
+=
+min(
+    Session Limit,
+    Model Limit,
+    Global Allocation,
+    Physical Throughput
+)
+```
+
+---
+
+# 67. 全局限速的公平调度
+
+如果：
+
+```text
+Global Limit = 1000 token/s
+```
+
+同时有：
+
+```text
+10 个 Unlimited Session
+```
+
+默认应近似公平分配：
+
+```text
+Session 1 ≈ 100 token/s
+Session 2 ≈ 100 token/s
+...
+Session 10 ≈ 100 token/s
+```
+
+推荐实现：
+
+```text
+Token Bucket
++
+Round Robin / Fair Queue
+```
+
+禁止第一个建立的 Session 永久抢占所有额度。
+
+---
+
+# 68. 不同 Session Limit 下的调度
+
+例如：
+
+```text
+Global = 1000 token/s
+
+A = 100 token/s
+B = 200 token/s
+C = Unlimited
+D = Unlimited
+```
+
+则可以得到近似：
+
+```text
+A = 100
+B = 200
+C = 350
+D = 350
+```
+
+合计：
+
+```text
+1000 token/s
+```
+
+即低限速 Session 未使用的全局额度应允许其他 Session 使用。
+
+---
+
+# 69. Token Bucket
+
+推荐 Rate Limiter 使用 Token Bucket。
+
+例如：
+
+```text
+rate = 100 token/s
+bucket = 100 tokens
+```
+
+意味着长期平均：
+
+```text
+100 token/s
+```
+
+允许非常短暂的小 Burst。
+
+后台必须允许设置：
+
+```text
+Burst Capacity
+```
+
+推荐：
+
+```text
+Off
+0.25 second
+0.5 second
+1 second
+Custom
+```
+
+默认：
+
+```text
+1 second
+```
+
+---
+
+# 70. Strict Smooth Mode
+
+为了测试非常稳定的模型输出，还必须提供：
+
+```text
+Smooth Rate
+```
+
+例如：
+
+```text
+10 token/s
+```
+
+意味着尽量实现：
+
+```text
+约每 100ms 发送 1 token
+```
+
+而不是：
+
+```text
+每秒突然发送 10 token
+然后停 1 秒
+```
+
+管理员可以选择：
+
+```text
+Smooth
+Burst
+Unlimited
+```
+
+---
+
+# 71. Chunk 与 Token Rate 解耦
+
+必须区分：
+
+```text
+Token Rate
+```
+
+和：
+
+```text
+Chunk Size
+```
+
+例如：
+
+```text
+100 token/s
+chunk_size = 20 tokens
+```
+
+可以表现为：
+
+```text
+约每 200ms
+发送一个 20-token chunk
+```
+
+而：
+
+```text
+100 token/s
+chunk_size = 1
+```
+
+则约：
+
+```text
+每 10ms
+发送一个 token
+```
+
+两者平均 Token Rate 相同。
+
+后台必须可以调整：
+
+```text
+Chunk Size
+```
+
+至少：
+
+```text
+1
+4
+8
+16
+32
+64
+128
+256
+Auto
+```
+
+---
+
+# 72. 全局并发量限制
+
+EpicAI 必须支持：
+
+```text
+Global Concurrent Session Limit
+```
+
+例如：
+
+```text
+Max Active Sessions = 100
+```
+
+定义：
+
+> 同时处于活动状态的 OpenAI 请求最多 100 个。
+
+包括：
+
+```text
+ECHOING
+PAUSED
+MANUAL
+ERROR_PENDING
+```
+
+达到 100 后，第 101 个请求按配置处理。
+
+---
+
+# 73. 并发超限行为
+
+后台允许选择：
+
+```text
+Reject
+Queue
+Hang
+Custom Error
+```
+
+## Reject
+
+立即：
+
+```text
+HTTP 429
+```
+
+默认：
+
+```json
+{
+  "error": {
+    "message": "EpicAI concurrent session limit exceeded",
+    "type": "rate_limit_error",
+    "code": "concurrency_limit_exceeded"
+  }
+}
+```
+
+## Queue
+
+请求进入：
+
+```text
+WAITING_FOR_SLOT
+```
+
+直到有 Session 退出。
+
+## Hang
+
+故意保持连接但不给任何响应。
+
+用于测试客户端超时。
+
+## Custom Error
+
+管理员自己指定：
+
+```text
+HTTP Status
+Error Code
+Error Message
+Raw Body
+```
+
+---
+
+# 74. 每 IP 并发限制
+
+建议支持：
+
+```text
+Max Sessions Per IP
+```
+
+例如：
+
+```text
+Global = 100
+
+Per IP = 5
+```
+
+单个 IP 最多占：
+
+```text
+5
+```
+
+个活动 Session。
+
+---
+
+# 75. 每 API Key 并发限制
+
+支持：
+
+```text
+Max Sessions Per API Key
+```
+
+例如：
+
+```text
+Key A = 3
+Key B = 50
+```
+
+方便测试客户端遇到：
+
+```text
+per-account concurrency limit
+```
+
+时的行为。
+
+---
+
+# 76. 单 Session 独立控制
+
+Session Inspector 增加：
+
+```text
+RATE CONTROL
+```
+
+显示：
+
+```text
+Current Rate:
+97.6 token/s
+
+Configured Rate:
+100 token/s
+
+Global Rate:
+10,000 token/s
+
+Effective Limit:
+100 token/s
+
+Tokens Sent:
+183,721
+
+Average Rate:
+99.2 token/s
+
+Peak Rate:
+104.3 token/s
+```
+
+并支持实时：
+
+```text
+[Unlimited]
+
+[1 token/s]
+[5]
+[10]
+[20]
+[50]
+[100]
+[500]
+[1000]
+
+[Custom ______ token/s]
+```
+
+---
+
+# 77. Dashboard 性能面板
+
+Dashboard 必须增加：
+
+```text
+OUTPUT THROUGHPUT
+```
+
+显示：
+
+```text
+Current:
+23,451 token/s
+
+1 minute average:
+21,872 token/s
+
+Peak:
+87,294 token/s
+
+Global Limit:
+100,000 token/s
+
+Utilization:
+23.45%
+```
+
+并显示：
+
+```text
+Active Sessions:
+78 / 100
+```
+
+---
+
+# 78. 会话 Token 统计
+
+每个 Session 必须持续统计：
+
+```text
+Input Tokens
+Output Tokens
+Total Tokens
+Current Output token/s
+Average Output token/s
+Peak Output token/s
+```
+
+Echo 产生的每次复读全部算：
+
+```text
+Output Tokens
+```
+
+例如输入：
+
+```text
+hello
+```
+
+假定 tokenizer 计算：
+
+```text
+1 token
+```
+
+复读：
+
+```text
+1000 次
+```
+
+则：
+
+```text
+Output Tokens = 1000
+```
+
+而不是因为内容相同只计算一次。
+
+---
+
+# 79. Rate Limit 与人工接管
+
+人工接管默认仍受：
+
+```text
+Session Rate Limit
++
+Global Rate Limit
+```
+
+约束。
+
+后台同时提供：
+
+```text
+Bypass Rate Limit for Manual Messages
+```
+
+默认：
+
+```text
+OFF
+```
+
+开启后管理员发送的人工消息可立即输出。
+
+---
+
+# 80. Rate Limit 与错误注入
+
+Error Injection：
+
+```text
+不受 Token Rate Limit 限制
+```
+
+管理员点击：
+
+```text
+INJECT ERROR
+```
+
+后应立即执行。
+
+不能因为：
+
+```text
+Session = 1 token/s
+```
+
+导致 429 要几十秒后才出现。
+
+---
+
+# 81. Rate Limit 与 Pause
+
+```text
+PAUSE
+```
+
+优先级高于所有 Rate Limit。
+
+Pause 时：
+
+```text
+Effective Rate = 0 token/s
+```
+
+Resume 后恢复原配置。
+
+---
+
+# 82. Rate Limit 优先级
+
+建议统一定义：
+
+```text
+DROP CONNECTION
+        ↓
+ERROR
+        ↓
+PAUSE
+        ↓
+MANUAL / ECHO
+        ↓
+Session Rate Limit
+        ↓
+Global Rate Limit
+        ↓
+Network Backpressure
+```
+
+---
+
+# 83. 动态限速
+
+所有以下配置：
+
+```text
+Global Token Rate
+Session Token Rate
+Global Concurrency
+Per-Key Concurrency
+Per-IP Concurrency
+Burst
+Chunk Size
+```
+
+均要求：
+
+> 无需重启 EpicAI。
+
+已经存在的 Session 中，适用项应实时生效。
+
+---
+
+# 84. 性能基准记录
+
+每次运行 Uncapped Benchmark 保存：
+
+```text
+benchmark_id
+timestamp
+protocol
+chunk_size
+duration
+tokens_sent
+average_token_rate
+peak_token_rate
+bytes_sent
+CPU usage
+memory usage
+```
+
+后台显示历史测试。
+
+例如：
+
+```text
+2026-09-08
+
+Chat Completions
+Chunk 128
+Average 8.73M token/s
+Peak 9.21M token/s
+```
+
+---
+
+# 85. 最高速率 UI
+
+Rate Limit 编辑框范围：
+
+```text
+Minimum:
+1 token/s
+
+Maximum:
+Measured Maximum
+
+Special:
+Unlimited
+```
+
+如果从未运行 Benchmark：
+
+后台应显示：
+
+```text
+Maximum has not been benchmarked.
+```
+
+同时允许：
+
+```text
+Unlimited
+```
+
+以及管理员手工配置：
+
+```text
+Administrative Maximum
+```
+
+禁止为了填 UI 范围而在代码里随意写死一个所谓“理论最大 token/s”。
+
+
+
+以上完整链路通过后，MVP 才算完成。

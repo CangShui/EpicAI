@@ -87,6 +87,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/api/login", s.handleLogin)
 	mux.HandleFunc("/admin/api/logout", s.handleLogout)
+	mux.HandleFunc("/admin/api/password", s.guard(s.handlePassword))
 	mux.HandleFunc("/admin/api/me", s.guard(s.handleMe))
 
 	mux.HandleFunc("/admin/api/stats", s.guard(s.handleStats))
@@ -98,9 +99,6 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("/admin/api/models", s.guard(s.handleModels))
 	mux.HandleFunc("/admin/api/models/", s.guard(s.handleModelDetail))
-
-	mux.HandleFunc("/admin/api/scenarios", s.guard(s.handleScenarios))
-	mux.HandleFunc("/admin/api/scenarios/", s.guard(s.handleScenarioDetail))
 
 	mux.HandleFunc("/admin/api/keys", s.guard(s.handleKeys))
 	mux.HandleFunc("/admin/api/keys/", s.guard(s.handleKeyDetail))
@@ -156,6 +154,34 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	tok := r.Header.Get("X-Admin-Token")
 	s.deps.Admin.Logout(tok)
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		writeErr(w, 405, "method not allowed", "")
+		return
+	}
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json body", "bad_request")
+		return
+	}
+	if req.NewPassword == "" {
+		writeErr(w, 400, "new password cannot be empty", "bad_request")
+		return
+	}
+	user := adminUser(r)
+	if _, ok := s.deps.Admin.Login(user, req.OldPassword); !ok {
+		writeErr(w, 403, "旧密码错误，修改失败", "forbidden")
+		return
+	}
+	s.deps.Admin.SetPassword(req.NewPassword)
+	_ = s.deps.Store.SetSetting(r.Context(), "admin_password", req.NewPassword)
+	s.deps.Audit.Log(audit.Entry{Action: "CHANGE_PASSWORD", Admin: user, IP: clientIP(r)})
+	writeJSON(w, 200, map[string]any{"ok": true, "message": "密码修改成功"})
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {

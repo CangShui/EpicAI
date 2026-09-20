@@ -57,6 +57,9 @@ func main() {
 
 	keyMgr := auth.New(store)
 	adminAuth := auth.NewAdmin()
+	if savedPass, err := store.GetSetting(context.Background(), "admin_password"); err == nil && savedPass != "" {
+		adminAuth.SetPassword(savedPass)
+	}
 	auditLog := audit.New(store)
 
 	wireRoutes := newRouter(routerDeps{

@@ -217,8 +217,21 @@ type Choice struct {
 }
 
 type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []ToolCallChunk `json:"tool_calls,omitempty"`
+}
+
+type ToolCallChunk struct {
+	Index    int           `json:"index"`
+	ID       string        `json:"id,omitempty"`
+	Type     string        `json:"type,omitempty"`
+	Function *FuncCallDiff `json:"function,omitempty"`
+}
+
+type FuncCallDiff struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type RespMsg struct {
@@ -238,6 +251,30 @@ func NewChunk(id, model string, created int64, content string, role string) Chun
 	c := Chunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []Choice{{Index: 0, Delta: &Delta{Content: content}}},
+	}
+	if role != "" {
+		c.Choices[0].Delta.Role = role
+	}
+	return c
+}
+
+func NewToolCallChunk(id, model string, created int64, tcIndex int, tcID, fnName, fnArgs, role string) Chunk {
+	c := Chunk{
+		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
+		Choices: []Choice{{
+			Index: 0,
+			Delta: &Delta{
+				ToolCalls: []ToolCallChunk{{
+					Index: tcIndex,
+					ID:    tcID,
+					Type:  "function",
+					Function: &FuncCallDiff{
+						Name:      fnName,
+						Arguments: fnArgs,
+					},
+				}},
+			},
+		}},
 	}
 	if role != "" {
 		c.Choices[0].Delta.Role = role

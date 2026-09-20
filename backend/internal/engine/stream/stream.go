@@ -27,7 +27,7 @@ type Captured struct {
 	Data string `json:"data"`
 }
 
-// Writer streams SSE to an HTTP client and implements scenario.Sink.
+// Writer streams SSE to an HTTP client.
 type Writer struct {
 	w        http.ResponseWriter
 	flusher  http.Flusher
@@ -46,8 +46,9 @@ type Writer struct {
 	doneFrame string
 
 	// adapter hooks
-	textFn   func(delta string) error
-	finishFn func(reason string) error
+	textFn     func(delta string) error
+	toolCallFn func(tcIndex int, tcID, fnName, fnArgs string) error
+	finishFn   func(reason string) error
 }
 
 func NewWriter(w http.ResponseWriter, session *sessions.Session) (*Writer, error) {
@@ -157,6 +158,28 @@ func (s *Writer) EmitText(ctx context.Context, delta string) error {
 	return s.WriteText(delta)
 }
 
+func (s *Writer) SetToolCallWriter(fn func(tcIndex int, tcID, fnName, fnArgs string) error) {
+	s.toolCallFn = fn
+}
+
+func (s *Writer) WriteToolCall(tcIndex int, tcID, fnName, fnArgs string) error {
+	if s.toolCallFn == nil {
+		return errors.New("no tool call writer configured")
+	}
+	return s.toolCallFn(tcIndex, tcID, fnName, fnArgs)
+}
+
+func (s *Writer) EmitToolCall(ctx context.Context, tcIndex int, tcID, fnName, fnArgs string) error {
+	tokens := tokenizer.Count(fnName + fnArgs)
+	if b := s.session.Bucket(); b != nil {
+		if !b.Wait(ctx, tokens) {
+			return ErrClientGone
+		}
+	}
+	s.session.AddOutputTokens(tokens)
+	return s.WriteToolCall(tcIndex, tcID, fnName, fnArgs)
+}
+
 // WriteText is protocol specific and set by the adapter.
 func (s *Writer) WriteText(delta string) error {
 	if s.textFn == nil {
@@ -169,7 +192,7 @@ type textFunc func(delta string) error
 
 var _ textFunc
 
-// EmitRaw implements scenario.Sink: writes a raw protocol line.
+// EmitRaw writes a raw protocol line.
 func (s *Writer) EmitRaw(ctx context.Context, payload string) error {
 	return s.WriteRaw(payload)
 }

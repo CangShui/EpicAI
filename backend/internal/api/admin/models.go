@@ -168,10 +168,6 @@ func applyModelPatch(m *storage.Model, p map[string]any) {
 			if sv, ok := v.(string); ok {
 				m.ProtocolMode = sv
 			}
-		case "scenario_id":
-			if sv, ok := v.(string); ok {
-				m.ScenarioID = sv
-			}
 		case "description":
 			if sv, ok := v.(string); ok {
 				m.Description = sv
@@ -202,6 +198,12 @@ func applyModelPatch(m *storage.Model, p map[string]any) {
 			}
 		case "max_echo_count":
 			m.MaxEchoCount = int(toInt64(v))
+		case "enable_agent":
+			m.EnableAgent = toBool(v)
+		case "subagent_count":
+			m.SubagentCount = int(toInt64(v))
+		case "max_token_chunk":
+			m.MaxTokenChunk = int(toInt64(v))
 		case "metadata":
 			if mv, ok := v.(map[string]any); ok {
 				m.Metadata = mv
@@ -210,83 +212,4 @@ func applyModelPatch(m *storage.Model, p map[string]any) {
 	}
 }
 
-// ---------------- scenarios ----------------
 
-func (s *Server) handleScenarios(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.deps.Store.ListScenarios(r.Context())
-		if err != nil {
-			writeErr(w, 500, err.Error(), "internal")
-			return
-		}
-		writeJSON(w, 200, list)
-	case http.MethodPost:
-		var sc storage.Scenario
-		if err := json.NewDecoder(r.Body).Decode(&sc); err != nil {
-			writeErr(w, 400, "invalid json", "bad_request")
-			return
-		}
-		if sc.Name == "" {
-			writeErr(w, 400, "name is required", "bad_request")
-			return
-		}
-		if sc.ID == "" {
-			sc.ID = newID("scen_")
-		}
-		if err := s.deps.Store.CreateScenario(r.Context(), &sc); err != nil {
-			writeErr(w, 409, err.Error(), "conflict")
-			return
-		}
-		s.deps.Audit.Log(auditEntry(r, "CREATE_SCENARIO", "", sc.ID))
-		writeJSON(w, 201, sc)
-	default:
-		writeErr(w, 405, "method not allowed", "")
-	}
-}
-
-func (s *Server) handleScenarioDetail(w http.ResponseWriter, r *http.Request) {
-	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/api/scenarios/"), "/")
-	if id == "" {
-		writeErr(w, 400, "scenario id required", "bad_request")
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		sc, err := s.deps.Store.GetScenario(r.Context(), id)
-		if err != nil || sc == nil {
-			writeErr(w, 404, "scenario not found", "not_found")
-			return
-		}
-		writeJSON(w, 200, sc)
-	case http.MethodPut, http.MethodPatch:
-		sc, err := s.deps.Store.GetScenario(r.Context(), id)
-		if err != nil || sc == nil {
-			writeErr(w, 404, "scenario not found", "not_found")
-			return
-		}
-		var updated storage.Scenario
-		if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
-			writeErr(w, 400, "invalid json", "bad_request")
-			return
-		}
-		sc.Name = updated.Name
-		sc.Description = updated.Description
-		sc.Steps = updated.Steps
-		if err := s.deps.Store.UpdateScenario(r.Context(), sc); err != nil {
-			writeErr(w, 500, err.Error(), "internal")
-			return
-		}
-		s.deps.Audit.Log(auditEntry(r, "UPDATE_SCENARIO", "", id))
-		writeJSON(w, 200, sc)
-	case http.MethodDelete:
-		if err := s.deps.Store.DeleteScenario(r.Context(), id); err != nil {
-			writeErr(w, 500, err.Error(), "internal")
-			return
-		}
-		s.deps.Audit.Log(auditEntry(r, "DELETE_SCENARIO", "", id))
-		writeJSON(w, 200, map[string]any{"ok": true})
-	default:
-		writeErr(w, 405, "method not allowed", "")
-	}
-}

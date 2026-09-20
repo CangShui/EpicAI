@@ -7,7 +7,7 @@ export async function logsPage(ctx) {
   const tabs = el('div', { class: 'tabs' });
   const host = el('div', { style: 'margin-top:14px' });
   let active = 'audit';
-  [['audit', 'Admin Audit'], ['vibe', '白话审计日志 (Vibe)'], ['conversation', 'Conversation Log'], ['access', 'Access Log']].forEach(([k, l]) => {
+  [['audit', '管理员操作审计 (Admin Audit)'], ['vibe', '白话全链路开发审计 (Vibe Logger)'], ['conversation', '会话事件明细 (Conversation)'], ['access', '请求访问日志 (Access Log)']].forEach(([k, l]) => {
     const t = el('div', { class: 'tab' + (k === active ? ' active' : '') }, l);
     t.addEventListener('click', () => {
       active = k;
@@ -21,28 +21,28 @@ export async function logsPage(ctx) {
   ctx.content.appendChild(host);
 
   const toolbar = el('div', { class: 'toolbar' });
-  const sessIn = el('input', { type: 'text', placeholder: 'session id (conversation log)' });
-  const loadBtn = el('button', { class: 'btn btn-sm' }, 'Load');
+  const sessIn = el('input', { type: 'text', placeholder: '输入会话 ID 查看事件明细' });
+  const loadBtn = el('button', { class: 'btn btn-sm' }, '查询');
   toolbar.appendChild(sessIn); toolbar.appendChild(loadBtn);
   ctx.content.insertBefore(toolbar, host);
 
   async function render() {
     clear(host);
     if (active === 'audit') {
-      const c = card('Admin Operation Log', { tight: true });
+      const c = card('管理员操作审计日志', { tight: true });
       const wrap = el('div', { class: 'table-wrap' });
       c.body.appendChild(wrap);
       host.appendChild(c.root);
       let list = [];
       try { list = await api.audit(300); } catch (e) {
-        wrap.appendChild(emptyBox('Failed: ' + e.message)); return;
+        wrap.appendChild(emptyBox('加载日志失败: ' + e.message)); return;
       }
       const table = el('table');
       const hr = el('tr');
-      ['Time', 'Admin', 'Action', 'Session', 'Params', 'IP'].forEach(h => hr.appendChild(el('th', {}, h)));
+      ['操作时间', '管理员', '动作指令', '涉及会话', '参数明细', '操作来源 IP'].forEach(h => hr.appendChild(el('th', {}, h)));
       table.appendChild(el('thead', {}, hr));
       const tbody = el('tbody');
-      if (!list.length) tbody.appendChild(el('tr', {}, el('td', { colspan: '6' }, emptyBox('No admin operations recorded yet.'))));
+      if (!list.length) tbody.appendChild(el('tr', {}, el('td', { colspan: '6' }, emptyBox('暂无管理员操作记录。'))));
       list.forEach(a => {
         const tr = el('tr');
         tr.appendChild(el('td', { class: 'nowrap dim' }, fmtDateTime(a.timestamp)));
@@ -79,7 +79,7 @@ export async function logsPage(ctx) {
         }
         box.scrollTop = box.scrollHeight;
       } catch (e) {
-        box.appendChild(emptyBox('Failed: ' + e.message));
+        box.appendChild(emptyBox('加载失败: ' + e.message));
       }
       return;
     }
@@ -87,7 +87,7 @@ export async function logsPage(ctx) {
     if (active === 'conversation') {
       const sid = sessIn.value.trim();
       if (!sid) {
-        host.appendChild(emptyBox('Enter a session id and click Load.'));
+        host.appendChild(emptyBox('请在上方的输入框中输入会话 ID 并点击查询。'));
         return;
       }
       const res = await api.sessionEvents(sid, 500);
@@ -103,13 +103,13 @@ export async function logsPage(ctx) {
 
     // access log = session records
     const res = await api.sessions({ limit: 200 });
-    const c = card('Access Log', { tight: true });
+    const c = card('HTTP 访问请求记录', { tight: true });
     const wrap = el('div', { class: 'table-wrap' });
     c.body.appendChild(wrap);
     host.appendChild(c.root);
     const table = el('table');
     const hr = el('tr');
-    ['Time', 'Method/Path', 'Protocol', 'Model', 'Client IP', 'Key', 'State', 'Bytes'].forEach(h => hr.appendChild(el('th', {}, h)));
+    ['请求时间', '方法与路径', '协议类型', '模型 ID', '客户端 IP', 'API Key 指纹', '最终状态', '流量输出'].forEach(h => hr.appendChild(el('th', {}, h)));
     table.appendChild(el('thead', {}, hr));
     const tbody = el('tbody');
     (res.sessions || []).forEach(s => {

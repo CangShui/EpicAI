@@ -58,6 +58,9 @@ export const api = {
     method: 'POST', body: JSON.stringify({ username, password })
   }).then(d => { api.token = d.token; state.token = d.token; return d; }),
   me: () => request('/admin/api/me'),
+  changePassword: (old_password, new_password) => request('/admin/api/password', {
+    method: 'POST', body: JSON.stringify({ old_password, new_password })
+  }),
 
   stats: () => request('/admin/api/stats'),
   settings: () => request('/admin/api/settings'),
@@ -80,11 +83,6 @@ export const api = {
   updateModel: (id, patch) => request('/admin/api/models/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(patch) }),
   cloneModel: (id, newId) => request(`/admin/api/models/${encodeURIComponent(id)}/clone`, { method: 'POST', body: JSON.stringify({ model_id: newId }) }),
   deleteModel: (id) => request('/admin/api/models/' + encodeURIComponent(id), { method: 'DELETE' }),
-
-  scenarios: () => request('/admin/api/scenarios'),
-  createScenario: (s) => request('/admin/api/scenarios', { method: 'POST', body: JSON.stringify(s) }),
-  updateScenario: (id, s) => request('/admin/api/scenarios/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(s) }),
-  deleteScenario: (id) => request('/admin/api/scenarios/' + encodeURIComponent(id), { method: 'DELETE' }),
 
   keys: () => request('/admin/api/keys'),
   createKey: (body) => request('/admin/api/keys', { method: 'POST', body: JSON.stringify(body) }),

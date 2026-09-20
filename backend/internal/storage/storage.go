@@ -10,14 +10,13 @@ import (
 type ModelBehavior string
 
 const (
-	BehaviorInfiniteEcho   ModelBehavior = "infinite_echo"
-	BehaviorFiniteEcho     ModelBehavior = "finite_echo"
-	BehaviorManualOnly     ModelBehavior = "manual_only"
-	BehaviorScenario       ModelBehavior = "scenario"
-	BehaviorImmediateError ModelBehavior = "immediate_error"
-	BehaviorHangForever    ModelBehavior = "hang_forever"
-	BehaviorStaticResponse ModelBehavior = "static_response"
-	BehaviorConnectionDrop ModelBehavior = "connection_drop"
+	BehaviorInfiniteEcho    ModelBehavior = "infinite_echo"
+	BehaviorInfiniteEchoMax ModelBehavior = "infinite_echo_max"
+	BehaviorManualOnly      ModelBehavior = "manual_only"
+	BehaviorImmediateError  ModelBehavior = "immediate_error"
+	BehaviorHangForever     ModelBehavior = "hang_forever"
+	BehaviorStaticResponse  ModelBehavior = "static_response"
+	BehaviorConnectionDrop  ModelBehavior = "connection_drop"
 )
 
 type Model struct {
@@ -29,7 +28,6 @@ type Model struct {
 	Behavior        ModelBehavior  `json:"behavior"`
 	EchoIntervalMS  int            `json:"default_echo_interval_ms"`
 	ProtocolMode    string         `json:"protocol_mode"`
-	ScenarioID      string         `json:"scenario_id,omitempty"`
 	Description     string         `json:"description,omitempty"`
 	StaticResponse  string         `json:"static_response,omitempty"`
 	ErrorStatus     int            `json:"error_status,omitempty"`
@@ -39,7 +37,12 @@ type Model struct {
 	TokenRate       int64          `json:"token_rate,omitempty"`
 	EchoContentMode string         `json:"echo_content_mode,omitempty"`
 	MaxEchoCount    int            `json:"max_echo_count,omitempty"`
-	Metadata        map[string]any `json:"metadata,omitempty"`
+	// Agent & Subagent capabilities
+	EnableAgent    bool `json:"enable_agent"`
+	SubagentCount  int  `json:"subagent_count"`
+	// Infinite Echo MAX stress test
+	MaxTokenChunk int `json:"max_token_chunk"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 // ---- Sessions ----
@@ -62,10 +65,9 @@ const (
 type SessionMode string
 
 const (
-	ModeEcho     SessionMode = "ECHO"
-	ModeManual   SessionMode = "MANUAL"
-	ModeScenario SessionMode = "SCENARIO"
-	ModeFault    SessionMode = "FAULT"
+	ModeEcho   SessionMode = "ECHO"
+	ModeManual SessionMode = "MANUAL"
+	ModeFault  SessionMode = "FAULT"
 )
 
 type RawRequest struct {
@@ -114,7 +116,6 @@ type Session struct {
 	Rate            RateConfig `json:"rate"`
 
 	Request      *RawRequest `json:"request,omitempty"`
-	ScenarioID   string      `json:"scenario_id,omitempty"`
 	FinishReason string      `json:"finish_reason,omitempty"`
 	EndReason    string      `json:"end_reason,omitempty"`
 }
@@ -187,35 +188,6 @@ type APIKey struct {
 	Models      []string   `json:"models,omitempty"`
 	MaxSessions int        `json:"max_sessions"`
 	RateLimit   int64      `json:"rate_limit"`
-}
-
-// ---- Scenarios ----
-
-type ScenarioStep struct {
-	Action       string `json:"action"`
-	Count        int    `json:"count,omitempty"`
-	IntervalMS   int    `json:"interval_ms,omitempty"`
-	Text         string `json:"text,omitempty"`
-	AssetID      string `json:"asset_id,omitempty"`
-	Raw          string `json:"raw,omitempty"`
-	HTTPStatus   int    `json:"http_status,omitempty"`
-	ErrorCode    string `json:"error_code,omitempty"`
-	ErrorType    string `json:"error_type,omitempty"`
-	ErrorMessage string `json:"message,omitempty"`
-	ErrorMode    string `json:"error_mode,omitempty"`
-	WaitMS       int    `json:"wait_ms,omitempty"`
-	Loop         bool   `json:"loop,omitempty"`
-	LoopCount    int    `json:"loop_count,omitempty"`
-	Malformed    bool   `json:"malformed,omitempty"`
-}
-
-type Scenario struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Steps       []ScenarioStep `json:"steps"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
 }
 
 // ---- Audit ----
@@ -316,13 +288,6 @@ type Store interface {
 	UpdateKey(ctx context.Context, k *APIKey) error
 	DeleteKey(ctx context.Context, id string) error
 	TouchKey(ctx context.Context, id string) error
-
-	// Scenarios
-	CreateScenario(ctx context.Context, s *Scenario) error
-	GetScenario(ctx context.Context, id string) (*Scenario, error)
-	ListScenarios(ctx context.Context) ([]Scenario, error)
-	UpdateScenario(ctx context.Context, s *Scenario) error
-	DeleteScenario(ctx context.Context, id string) error
 
 	// Audit
 	AppendAudit(ctx context.Context, a *AuditEntry) error

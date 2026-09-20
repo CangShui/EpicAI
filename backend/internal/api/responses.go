@@ -93,6 +93,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		UserAgent: r.UserAgent(), KeyFP: fp, Conv: conv,
 		RateLimit: model.TokenRate, EchoContentMode: model.EchoContentMode,
 	})
+	ses.SetRequestMeta(extractToolNames(req.Tools), pickMaxTokens(req.MaxOutputTokens, nil))
 	ses.SetRawRequest(&storage.RawRequest{
 		Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
 		Headers: sanitizeHeaders(r.Header), Body: string(body),

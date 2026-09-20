@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +72,9 @@ type Session struct {
 	CreatedAt time.Time
 	Conv      *canonical.Conversation
 	rawRequest *storage.RawRequest
+	// request metadata captured before any storage truncation
+	reqTools     []string
+	reqMaxTokens int
 
 	store storage.Store
 	bus   *events.Bus
@@ -279,7 +283,6 @@ type Options struct {
 	Conv            *canonical.Conversation
 	RateLimit       int64
 	EchoContentMode string
-	ScenarioID      string
 	KillConn        func()
 }
 
@@ -358,7 +361,7 @@ func (s *Session) snapshot() *storage.Session {
 		InputTokens: s.inputTokens, OutputTokens: s.outputTokens, ChunkCount: s.chunkCount,
 		CurrentRate: cur, AverageRate: avg, PeakRate: peak,
 		EchoIntervalMS: s.intervalMS, EchoContentMode: s.echoMode, Rate: rate,
-		ScenarioID: "", EndReason: s.endReason,
+		EndReason: s.endReason,
 		Request: s.rawRequest,
 	}
 }
@@ -385,14 +388,52 @@ func (s *Session) Persist() {
 	}
 }
 
-// SetRawRequest attaches the original HTTP request metadata.
+// maxStoredBodyBytes caps how much of the request body is persisted with a
+// session. Agent clients can send multi-megabyte prompts; storing them verbatim
+// for every session quickly exhausts disk and memory.
+const maxStoredBodyBytes = 200 * 1024
+
+// SetRawRequest attaches the original HTTP request metadata. The body is
+// truncated only for storage; request metadata (tools / max_tokens) is captured
+// separately via SetRequestMeta before truncation.
 func (s *Session) SetRawRequest(req *storage.RawRequest, bytesIn int64) {
+	stored := req
+	if req != nil && len(req.Body) > maxStoredBodyBytes {
+		cp := *req
+		cp.Body = req.Body[:maxStoredBodyBytes] +
+			"\n...[truncated " + strconv.Itoa(len(req.Body)-maxStoredBodyBytes) + " bytes by EpicAI]"
+		stored = &cp
+	}
 	s.mu.Lock()
 	s.bytesIn = bytesIn
-	s.rawRequest = req
+	s.rawRequest = stored
 	s.mu.Unlock()
 	snap := s.snapshot()
 	_ = s.store.UpdateSession(context.Background(), snap)
+}
+
+// SetRequestMeta records the tool names declared by the client and its output
+// token budget. These drive agent mode and rate/budget caps; they must be taken
+// from the full request before storage truncation.
+func (s *Session) SetRequestMeta(tools []string, maxTokens int) {
+	s.mu.Lock()
+	s.reqTools = tools
+	s.reqMaxTokens = maxTokens
+	s.mu.Unlock()
+}
+
+// RequestTools returns the tool names declared by the client request.
+func (s *Session) RequestTools() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reqTools
+}
+
+// RequestMaxTokens returns the client's max_tokens/max_completion_tokens (0 = unset).
+func (s *Session) RequestMaxTokens() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reqMaxTokens
 }
 
 // PublishState broadcasts a state change to admin clients.
@@ -696,6 +737,8 @@ func (s *Session) AddEcho() {
 
 func (s *Session) EchoCount() int64 { return atomic.LoadInt64(&s.echoCount) }
 
+func (s *Session) OutputTokens() int64 { return atomic.LoadInt64(&s.outputTokens) }
+
 func (s *Session) AddChunk(n int)    { atomic.AddInt64(&s.chunkCount, int64(n)) }
 func (s *Session) ChunkCount() int64 { return atomic.LoadInt64(&s.chunkCount) }
 
@@ -704,13 +747,24 @@ func (s *Session) AddBytesOut(n int) {
 	s.lastActivity.Store(time.Now().UnixNano())
 }
 
-func (s *Session) AddOutputTokens(n int) { atomic.AddInt64(&s.outputTokens, int64(n)) }
+func (s *Session) AddOutputTokens(n int) {
+	atomic.AddInt64(&s.outputTokens, int64(n))
+	if s.bucket != nil {
+		s.bucket.Account(n)
+	}
+}
 
 func (s *Session) BytesOut() int64 { return atomic.LoadInt64(&s.bytesOut) }
 
 func (s *Session) NextSeq() int64 { return s.seq.Add(1) }
 
 func (s *Session) Bucket() *ratelimit.SessionBucket { return s.bucket }
+
+func (s *Session) RawRequest() *storage.RawRequest {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rawRequest
+}
 
 func (s *Session) EndReason() string {
 	s.mu.RLock()

@@ -13,12 +13,47 @@ import (
 	ochat "github.com/epicai/epicai/backend/internal/adapters/openai_chat"
 	"github.com/epicai/epicai/backend/internal/canonical"
 	"github.com/epicai/epicai/backend/internal/config"
+	"github.com/epicai/epicai/backend/internal/engine/echo"
 	"github.com/epicai/epicai/backend/internal/engine/stream"
 	"github.com/epicai/epicai/backend/internal/sessions"
 	"github.com/epicai/epicai/backend/internal/storage"
 	"github.com/epicai/epicai/backend/internal/tokenizer"
 	"github.com/epicai/epicai/backend/internal/vlog"
 )
+
+// extractToolNames pulls the declared function-tool names out of a parsed
+// OpenAI chat request. Anthropic-style tool entries (no "function" wrapper) are
+// also tolerated.
+func extractToolNames(raw []any) []string {
+	var names []string
+	for _, t := range raw {
+		m, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := m["function"].(map[string]any); ok {
+			if name, ok := fn["name"].(string); ok && name != "" {
+				names = append(names, name)
+			}
+			continue
+		}
+		if name, ok := m["name"].(string); ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// pickMaxTokens returns max_completion_tokens when set, otherwise max_tokens.
+func pickMaxTokens(maxTokens, maxCompletionTokens *int) int {
+	if maxCompletionTokens != nil && *maxCompletionTokens > 0 {
+		return *maxCompletionTokens
+	}
+	if maxTokens != nil && *maxTokens > 0 {
+		return *maxTokens
+	}
+	return 0
+}
 
 // HandleChatCompletions serves POST /v1/chat/completions.
 func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +132,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		UserAgent: r.UserAgent(), KeyFP: fp, Conv: conv,
 		RateLimit: orRate(model.TokenRate), EchoContentMode: model.EchoContentMode,
 	})
+	ses.SetRequestMeta(extractToolNames(req.Tools), pickMaxTokens(req.MaxTokens, req.MaxCompletionTokens))
 
 	ses.SetRawRequest(&storage.RawRequest{
 		Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
@@ -131,6 +167,101 @@ func (s *Server) handleChatNonStream(w http.ResponseWriter, r *http.Request, ses
 		ses.SetState(storage.StateEchoing)
 		<-r.Context().Done()
 		ses.Close(storage.StateClientDisconnected, "client_disconnected")
+		return
+	}
+
+	// Agent Echo behavior in non-streaming mode. Only active when the client
+	// actually declared tools — a request without tools (e.g. opencode's context
+	// summarizer) must never receive tool calls.
+	availableTools := ses.RequestTools()
+	if model.EnableAgent && len(availableTools) > 0 {
+		subCount := model.SubagentCount
+		if subCount <= 0 {
+			subCount = 1
+		}
+		blockTokens := 0
+		if model.Behavior == storage.BehaviorInfiniteEchoMax {
+			blockTokens = model.MaxTokenChunk
+			if blockTokens <= 0 {
+				blockTokens = 2048
+			}
+			if mt := ses.RequestMaxTokens(); mt > 0 {
+				if budget := mt / (1 + subCount); budget >= 1 && blockTokens > budget {
+					blockTokens = budget
+				}
+			}
+		}
+
+		var textContent string
+		if model.Behavior == storage.BehaviorInfiniteEchoMax {
+			textContent = echo.BuildInfiniteMaxText(conv.LastUserText(), blockTokens)
+		} else {
+			textContent = conv.LastUserText()
+		}
+		spec := echo.BuildAgentEchoCall(availableTools, textContent)
+
+		var tcs []any
+		for i := 0; i < subCount; i++ {
+			callID := fmt.Sprintf("call_epic_%s_%d", id[len(id)-8:], i)
+			tcs = append(tcs, map[string]any{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      spec.ToolName,
+					"arguments": spec.Arguments,
+				},
+			})
+		}
+
+		outTokens := tokenizer.Count(textContent)
+		ses.AddOutputTokens(outTokens)
+		ses.AddEcho()
+		s.logOutput(ses, textContent, outTokens)
+
+		reason := "tool_calls"
+		usage := &ochat.Usage{
+			PromptTokens:     int(ses.SnapshotTokens().Input),
+			CompletionTokens: int(outTokens) + 20*subCount,
+			TotalTokens:      int(ses.SnapshotTokens().Input) + int(outTokens) + 20*subCount,
+		}
+		resp := ochat.FullResponse{
+			ID: id, Object: "chat.completion", Created: created, Model: model.ModelID,
+			Choices: []ochat.Choice{{
+				Index: 0,
+				Message: &ochat.RespMsg{
+					Role:      "assistant",
+					Content:   &textContent,
+					ToolCalls: tcs,
+				},
+				FinishReason: &reason,
+			}},
+			Usage: usage,
+		}
+		vlog.BizEntry(traceID, "chat_non_stream_agent_echo", "下发Agent工具调用与吐字", fmt.Sprintf("%s x %d, text_len: %d", spec.ToolName, subCount, len(textContent)))
+		writeJSON(w, 200, resp)
+		return
+	}
+
+	// Infinite Echo MAX behavior in non-streaming mode
+	if model.Behavior == storage.BehaviorInfiniteEchoMax {
+		maxTok := model.MaxTokenChunk
+		if maxTok <= 0 {
+			maxTok = 2048
+		}
+		text := echo.BuildInfiniteMaxText(conv.LastUserText(), maxTok)
+		tokens := tokenizer.Count(text)
+		ses.AddOutputTokens(tokens)
+		ses.AddEcho()
+		s.logOutput(ses, text, tokens)
+
+		usage := &ochat.Usage{
+			PromptTokens:     int(ses.SnapshotTokens().Input),
+			CompletionTokens: int(tokens),
+			TotalTokens:      int(ses.SnapshotTokens().Input) + int(tokens),
+		}
+		resp := ochat.NewFullResponse(id, model.ModelID, created, text, conv.LastUserParts(), usage)
+		vlog.ResponseSent(traceID, "chat_non_stream_echo_max", 200, "tokens="+fmt.Sprintf("%d", tokens), "", "成功", "非流式无限回显MAX完成")
+		writeJSON(w, 200, resp)
 		return
 	}
 
@@ -173,6 +304,16 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request, ses *s
 		return sw.WriteFrame(string(b))
 	}, func(reason string) error {
 		c := ochat.FinalChunk(id, model.ModelID, created, reason)
+		b, _ := json.Marshal(c)
+		return sw.WriteFrame(string(b))
+	})
+	sw.SetToolCallWriter(func(tcIndex int, tcID, fnName, fnArgs string) error {
+		role := ""
+		if first != nil && !first.Get() {
+			role = "assistant"
+			first.Set(true)
+		}
+		c := ochat.NewToolCallChunk(id, model.ModelID, created, tcIndex, tcID, fnName, fnArgs, role)
 		b, _ := json.Marshal(c)
 		return sw.WriteFrame(string(b))
 	})

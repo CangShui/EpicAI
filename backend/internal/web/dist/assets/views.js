@@ -1,16 +1,15 @@
 // View composition: shell + routed pages.
-import { api } from './api.js';
-import { state } from './state.js';
-import { el, clear, fmtBytes, fmtNum, fmtRate, fmtDuration, fmtTime, fmtDateTime, stateBadge } from './dom.js';
-import { dashboard } from './page-dashboard.js';
-import { sessionsPage } from './page-sessions.js';
-import { sessionPage } from './page-session.js';
-import { modelsPage } from './page-models.js';
-import { scenariosPage } from './page-scenarios.js';
-import { keysPage } from './page-keys.js';
-import { filesPage } from './page-files.js';
-import { logsPage } from './page-logs.js';
-import { settingsPage } from './page-settings.js';
+import { api } from './api.js?v=1.4';
+import { state } from './state.js?v=1.4';
+import { el, clear, fmtBytes, fmtNum, fmtRate, fmtDuration, fmtTime, fmtDateTime, stateBadge } from './dom.js?v=1.4';
+import { dashboard } from './page-dashboard.js?v=1.4';
+import { sessionsPage } from './page-sessions.js?v=1.4';
+import { sessionPage } from './page-session.js?v=1.4';
+import { modelsPage } from './page-models.js?v=1.4';
+import { keysPage } from './page-keys.js?v=1.4';
+import { filesPage } from './page-files.js?v=1.4';
+import { logsPage } from './page-logs.js?v=1.4';
+import { settingsPage } from './page-settings.js?v=1.4';
 
 export function renderShell(routes) {
   const layout = el('div', { class: 'layout' });
@@ -18,7 +17,7 @@ export function renderShell(routes) {
   const sidebar = el('aside', { class: 'sidebar' });
   const brand = el('div', { class: 'brand' });
   brand.appendChild(el('div', { class: 'brand-name' }, 'EpicAI'));
-  brand.appendChild(el('div', { class: 'brand-sub' }, 'Endpoint Simulator'));
+  brand.appendChild(el('div', { class: 'brand-sub' }, '接口模拟与故障平台'));
   sidebar.appendChild(brand);
 
   const nav = el('nav', { class: 'nav' });
@@ -54,11 +53,13 @@ export function renderShell(routes) {
   conn.appendChild(el('span', { class: 'conn-text' }, 'Offline'));
   topbar.appendChild(conn);
   topbar.appendChild(el('span', { class: 'dim mono' }, state.user || ''));
+  const changePwdBtn = el('button', { class: 'btn btn-sm', onclick: () => openChangePasswordModal() }, '修改密码');
+  topbar.appendChild(changePwdBtn);
   const out = el('button', { class: 'btn btn-sm', onclick: () => {
     localStorage.removeItem('epicai_token');
     state.token = null; api.token = null; state.user = null;
     location.reload();
-  } }, 'Sign out');
+  } }, '退出登录');
   topbar.appendChild(out);
   main.appendChild(topbar);
 
@@ -88,7 +89,6 @@ export async function mountView(route) {
     case 'sessions': return sessionsPage(ctx);
     case 'session': return sessionPage(ctx);
     case 'models': return modelsPage(ctx);
-    case 'scenarios': return scenariosPage(ctx);
     case 'keys': return keysPage(ctx);
     case 'files': return filesPage(ctx);
     case 'logs': return logsPage(ctx);
@@ -146,13 +146,53 @@ export function modal(title, bodyNode, footerNode) {
 export function confirmModal(title, message, onConfirm, danger = true) {
   const body = el('div', {}, el('p', { style: 'margin:0 0 6px' }, message));
   const foot = el('div', { class: 'row' });
-  const cancel = el('button', { class: 'btn' }, 'Cancel');
-  const ok = el('button', { class: danger ? 'btn btn-danger' : 'btn btn-primary' }, 'Confirm');
+  const cancel = el('button', { class: 'btn' }, '取消');
+  const ok = el('button', { class: danger ? 'btn btn-danger' : 'btn btn-primary' }, '确认');
   foot.appendChild(cancel); foot.appendChild(ok);
   const m = modal(title, body, foot);
   cancel.addEventListener('click', () => m.close());
   ok.addEventListener('click', async () => { m.close(); await onConfirm(); });
   return m;
+}
+
+export function openChangePasswordModal() {
+  const body = el('div');
+  const oldPass = el('input', { type: 'password', placeholder: '请输入当前密码' });
+  const newPass = el('input', { type: 'password', placeholder: '请输入新密码' });
+  const confirmPass = el('input', { type: 'password', placeholder: '请再次输入新密码' });
+  const errBox = el('div', { style: 'color:var(--red);font-size:12px;margin-top:4px;min-height:16px' });
+
+  body.appendChild(el('label', { class: 'field' }, el('span', {}, '当前密码'), oldPass));
+  body.appendChild(el('label', { class: 'field' }, el('span', {}, '新密码'), newPass));
+  body.appendChild(el('label', { class: 'field' }, el('span', {}, '确认新密码'), confirmPass));
+  body.appendChild(errBox);
+
+  const foot = el('div', { class: 'row', style: 'justify-content:flex-end;gap:8px' });
+  const cancel = el('button', { class: 'btn' }, '取消');
+  const submit = el('button', { class: 'btn btn-primary' }, '确认修改');
+  foot.appendChild(cancel); foot.appendChild(submit);
+
+  const m = modal('修改管理员登录密码', body, foot);
+  cancel.addEventListener('click', () => m.close());
+
+  submit.addEventListener('click', async () => {
+    errBox.textContent = '';
+    if (!oldPass.value) { errBox.textContent = '请输入当前密码'; return; }
+    if (!newPass.value) { errBox.textContent = '请输入新密码'; return; }
+    if (newPass.value !== confirmPass.value) { errBox.textContent = '两次输入的新密码不一致'; return; }
+
+    submit.disabled = true;
+    try {
+      await api.changePassword(oldPass.value, newPass.value);
+      alert('密码修改成功，请重新登录！');
+      m.close();
+      localStorage.removeItem('epicai_token');
+      location.reload();
+    } catch (e) {
+      errBox.textContent = e.message || '修改密码失败';
+      submit.disabled = false;
+    }
+  });
 }
 
 export { el, clear, fmtBytes, fmtNum, fmtRate, fmtDuration, fmtTime, fmtDateTime, stateBadge };

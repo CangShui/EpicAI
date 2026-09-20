@@ -70,7 +70,6 @@ func (s *Store) migrate() error {
 			behavior TEXT NOT NULL,
 			echo_interval_ms INTEGER NOT NULL DEFAULT 500,
 			protocol_mode TEXT NOT NULL DEFAULT 'openai',
-			scenario_id TEXT,
 			description TEXT,
 			static_response TEXT,
 			error_status INTEGER,
@@ -109,7 +108,6 @@ func (s *Store) migrate() error {
 			echo_content_mode TEXT,
 			rate_config TEXT,
 			raw_request TEXT,
-			scenario_id TEXT,
 			finish_reason TEXT,
 			end_reason TEXT
 		)`,
@@ -166,14 +164,6 @@ func (s *Store) migrate() error {
 			rate_limit INTEGER DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash)`,
-		`CREATE TABLE IF NOT EXISTS scenarios (
-			id TEXT PRIMARY KEY,
-			name TEXT,
-			description TEXT,
-			steps TEXT,
-			created_at DATETIME,
-			updated_at DATETIME
-		)`,
 		`CREATE TABLE IF NOT EXISTS audit (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			timestamp DATETIME,
@@ -214,7 +204,7 @@ func (s *Store) migrate() error {
 
 func (s *Store) ListModels(ctx context.Context) ([]storage.Model, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT model_id,display_name,enabled,created_at,updated_at,behavior,
-		echo_interval_ms,protocol_mode,COALESCE(scenario_id,''),COALESCE(description,''),COALESCE(static_response,''),
+		echo_interval_ms,protocol_mode,COALESCE(description,''),COALESCE(static_response,''),
 		COALESCE(error_status,0),COALESCE(error_code,''),COALESCE(error_type,''),COALESCE(error_message,''),
 		COALESCE(token_rate,0),COALESCE(echo_content_mode,''),COALESCE(max_echo_count,0),COALESCE(metadata,'')
 		FROM models ORDER BY created_at`)
@@ -227,7 +217,7 @@ func (s *Store) ListModels(ctx context.Context) ([]storage.Model, error) {
 
 func (s *Store) ListEnabledModels(ctx context.Context) ([]storage.Model, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT model_id,display_name,enabled,created_at,updated_at,behavior,
-		echo_interval_ms,protocol_mode,COALESCE(scenario_id,''),COALESCE(description,''),COALESCE(static_response,''),
+		echo_interval_ms,protocol_mode,COALESCE(description,''),COALESCE(static_response,''),
 		COALESCE(error_status,0),COALESCE(error_code,''),COALESCE(error_type,''),COALESCE(error_message,''),
 		COALESCE(token_rate,0),COALESCE(echo_content_mode,''),COALESCE(max_echo_count,0),COALESCE(metadata,'')
 		FROM models WHERE enabled=1 ORDER BY created_at`)
@@ -245,7 +235,7 @@ func scanModels(rows *sql.Rows) ([]storage.Model, error) {
 		var meta string
 		var enc int
 		if err := rows.Scan(&m.ModelID, &m.DisplayName, &enc, &m.CreatedAt, &m.UpdatedAt, &m.Behavior,
-			&m.EchoIntervalMS, &m.ProtocolMode, &m.ScenarioID, &m.Description, &m.StaticResponse,
+			&m.EchoIntervalMS, &m.ProtocolMode, &m.Description, &m.StaticResponse,
 			&m.ErrorStatus, &m.ErrorCode, &m.ErrorType, &m.ErrorMessage, &m.TokenRate,
 			&m.EchoContentMode, &m.MaxEchoCount, &meta); err != nil {
 			return nil, err
@@ -253,6 +243,17 @@ func scanModels(rows *sql.Rows) ([]storage.Model, error) {
 		m.Enabled = enc != 0
 		if meta != "" {
 			_ = json.Unmarshal([]byte(meta), &m.Metadata)
+			if m.Metadata != nil {
+				if v, ok := m.Metadata["enable_agent"].(bool); ok {
+					m.EnableAgent = v
+				}
+				if v, ok := m.Metadata["subagent_count"].(float64); ok {
+					m.SubagentCount = int(v)
+				}
+				if v, ok := m.Metadata["max_token_chunk"].(float64); ok {
+					m.MaxTokenChunk = int(v)
+				}
+			}
 		}
 		out = append(out, m)
 	}
@@ -261,7 +262,7 @@ func scanModels(rows *sql.Rows) ([]storage.Model, error) {
 
 func (s *Store) GetModel(ctx context.Context, id string) (*storage.Model, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT model_id,display_name,enabled,created_at,updated_at,behavior,
-		echo_interval_ms,protocol_mode,COALESCE(scenario_id,''),COALESCE(description,''),COALESCE(static_response,''),
+		echo_interval_ms,protocol_mode,COALESCE(description,''),COALESCE(static_response,''),
 		COALESCE(error_status,0),COALESCE(error_code,''),COALESCE(error_type,''),COALESCE(error_message,''),
 		COALESCE(token_rate,0),COALESCE(echo_content_mode,''),COALESCE(max_echo_count,0),COALESCE(metadata,'')
 		FROM models WHERE model_id=?`, id)
@@ -269,7 +270,7 @@ func (s *Store) GetModel(ctx context.Context, id string) (*storage.Model, error)
 	var meta string
 	var enc int
 	err := row.Scan(&m.ModelID, &m.DisplayName, &enc, &m.CreatedAt, &m.UpdatedAt, &m.Behavior,
-		&m.EchoIntervalMS, &m.ProtocolMode, &m.ScenarioID, &m.Description, &m.StaticResponse,
+		&m.EchoIntervalMS, &m.ProtocolMode, &m.Description, &m.StaticResponse,
 		&m.ErrorStatus, &m.ErrorCode, &m.ErrorType, &m.ErrorMessage, &m.TokenRate,
 		&m.EchoContentMode, &m.MaxEchoCount, &meta)
 	if err != nil {
@@ -278,11 +279,28 @@ func (s *Store) GetModel(ctx context.Context, id string) (*storage.Model, error)
 	m.Enabled = enc != 0
 	if meta != "" {
 		_ = json.Unmarshal([]byte(meta), &m.Metadata)
+		if m.Metadata != nil {
+			if v, ok := m.Metadata["enable_agent"].(bool); ok {
+				m.EnableAgent = v
+			}
+			if v, ok := m.Metadata["subagent_count"].(float64); ok {
+				m.SubagentCount = int(v)
+			}
+			if v, ok := m.Metadata["max_token_chunk"].(float64); ok {
+				m.MaxTokenChunk = int(v)
+			}
+		}
 	}
 	return &m, nil
 }
 
 func (s *Store) CreateModel(ctx context.Context, m *storage.Model) error {
+	if m.Metadata == nil {
+		m.Metadata = make(map[string]any)
+	}
+	m.Metadata["enable_agent"] = m.EnableAgent
+	m.Metadata["subagent_count"] = m.SubagentCount
+	m.Metadata["max_token_chunk"] = m.MaxTokenChunk
 	meta, _ := json.Marshal(m.Metadata)
 	now := time.Now()
 	if m.CreatedAt.IsZero() {
@@ -290,24 +308,30 @@ func (s *Store) CreateModel(ctx context.Context, m *storage.Model) error {
 	}
 	m.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `INSERT INTO models (model_id,display_name,enabled,created_at,updated_at,behavior,
-		echo_interval_ms,protocol_mode,scenario_id,description,static_response,error_status,error_code,error_type,
+		echo_interval_ms,protocol_mode,description,static_response,error_status,error_code,error_type,
 		error_message,token_rate,echo_content_mode,max_echo_count,metadata)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		m.ModelID, m.DisplayName, boolInt(m.Enabled), m.CreatedAt, m.UpdatedAt, string(m.Behavior),
-		m.EchoIntervalMS, m.ProtocolMode, nullStr(m.ScenarioID), nullStr(m.Description), nullStr(m.StaticResponse),
+		m.EchoIntervalMS, m.ProtocolMode, nullStr(m.Description), nullStr(m.StaticResponse),
 		m.ErrorStatus, nullStr(m.ErrorCode), nullStr(m.ErrorType), nullStr(m.ErrorMessage),
 		m.TokenRate, nullStr(m.EchoContentMode), m.MaxEchoCount, string(meta))
 	return err
 }
 
 func (s *Store) UpdateModel(ctx context.Context, m *storage.Model) error {
+	if m.Metadata == nil {
+		m.Metadata = make(map[string]any)
+	}
+	m.Metadata["enable_agent"] = m.EnableAgent
+	m.Metadata["subagent_count"] = m.SubagentCount
+	m.Metadata["max_token_chunk"] = m.MaxTokenChunk
 	meta, _ := json.Marshal(m.Metadata)
 	m.UpdatedAt = time.Now()
 	res, err := s.db.ExecContext(ctx, `UPDATE models SET display_name=?,enabled=?,updated_at=?,behavior=?,
-		echo_interval_ms=?,protocol_mode=?,scenario_id=?,description=?,static_response=?,error_status=?,error_code=?,
+		echo_interval_ms=?,protocol_mode=?,description=?,static_response=?,error_status=?,error_code=?,
 		error_type=?,error_message=?,token_rate=?,echo_content_mode=?,max_echo_count=?,metadata=? WHERE model_id=?`,
 		m.DisplayName, boolInt(m.Enabled), m.UpdatedAt, string(m.Behavior),
-		m.EchoIntervalMS, m.ProtocolMode, nullStr(m.ScenarioID), nullStr(m.Description), nullStr(m.StaticResponse),
+		m.EchoIntervalMS, m.ProtocolMode, nullStr(m.Description), nullStr(m.StaticResponse),
 		m.ErrorStatus, nullStr(m.ErrorCode), nullStr(m.ErrorType), nullStr(m.ErrorMessage),
 		m.TokenRate, nullStr(m.EchoContentMode), m.MaxEchoCount, string(meta), m.ModelID)
 	if err != nil {
@@ -333,13 +357,13 @@ func (s *Store) CreateSession(ctx context.Context, ses *storage.Session) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions (session_id,request_id,protocol,model,streaming,client_ip,
 		user_agent,key_fingerprint,state,mode,created_at,updated_at,ended_at,echo_count,bytes_in,bytes_out,
 		input_tokens,output_tokens,chunk_count,current_rate,average_rate,peak_rate,echo_interval_ms,echo_content_mode,
-		rate_config,raw_request,scenario_id,finish_reason,end_reason)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rate_config,raw_request,finish_reason,end_reason)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ses.ID, ses.RequestID, ses.Protocol, ses.Model, boolInt(ses.Streaming), ses.ClientIP,
 		ses.UserAgent, ses.KeyFingerprint, string(ses.State), string(ses.Mode), ses.CreatedAt, ses.UpdatedAt, ses.EndedAt,
 		ses.EchoCount, ses.BytesIn, ses.BytesOut, ses.InputTokens, ses.OutputTokens, ses.ChunkCount,
 		ses.CurrentRate, ses.AverageRate, ses.PeakRate, ses.EchoIntervalMS, ses.EchoContentMode,
-		string(rate), string(req), nullStr(ses.ScenarioID), nullStr(ses.FinishReason), nullStr(ses.EndReason))
+		string(rate), string(req), nullStr(ses.FinishReason), nullStr(ses.EndReason))
 	return err
 }
 
@@ -354,12 +378,12 @@ func (s *Store) UpdateSession(ctx context.Context, ses *storage.Session) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET request_id=?,protocol=?,model=?,streaming=?,client_ip=?,
 		user_agent=?,key_fingerprint=?,state=?,mode=?,updated_at=?,ended_at=?,echo_count=?,bytes_in=?,bytes_out=?,
 		input_tokens=?,output_tokens=?,chunk_count=?,current_rate=?,average_rate=?,peak_rate=?,echo_interval_ms=?,
-		echo_content_mode=?,rate_config=?,raw_request=COALESCE(?,raw_request),scenario_id=?,finish_reason=?,end_reason=? WHERE session_id=?`,
+		echo_content_mode=?,rate_config=?,raw_request=COALESCE(?,raw_request),finish_reason=?,end_reason=? WHERE session_id=?`,
 		ses.RequestID, ses.Protocol, ses.Model, boolInt(ses.Streaming), ses.ClientIP,
 		ses.UserAgent, ses.KeyFingerprint, string(ses.State), string(ses.Mode), ses.UpdatedAt, ses.EndedAt,
 		ses.EchoCount, ses.BytesIn, ses.BytesOut, ses.InputTokens, ses.OutputTokens, ses.ChunkCount,
 		ses.CurrentRate, ses.AverageRate, ses.PeakRate, ses.EchoIntervalMS, ses.EchoContentMode,
-		string(rate), reqJSON, nullStr(ses.ScenarioID), nullStr(ses.FinishReason), nullStr(ses.EndReason), ses.ID)
+		string(rate), reqJSON, nullStr(ses.FinishReason), nullStr(ses.EndReason), ses.ID)
 	return err
 }
 
@@ -370,7 +394,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (*storage.Session, er
 		COALESCE(echo_count,0),COALESCE(bytes_in,0),COALESCE(bytes_out,0),COALESCE(input_tokens,0),
 		COALESCE(output_tokens,0),COALESCE(chunk_count,0),COALESCE(current_rate,0),COALESCE(average_rate,0),
 		COALESCE(peak_rate,0),COALESCE(echo_interval_ms,500),COALESCE(echo_content_mode,''),
-		COALESCE(rate_config,''),COALESCE(raw_request,''),COALESCE(scenario_id,''),COALESCE(finish_reason,''),COALESCE(end_reason,'')
+		COALESCE(rate_config,''),COALESCE(raw_request,''),COALESCE(finish_reason,''),COALESCE(end_reason,'')
 		FROM sessions WHERE session_id=?`, id)
 	return scanSession(row)
 }
@@ -386,7 +410,7 @@ func scanSession(row scanner) (*storage.Session, error) {
 		&s.KeyFingerprint, &s.State, &s.Mode, &rawCreated, &rawUpdated, &rawEnded,
 		&s.EchoCount, &s.BytesIn, &s.BytesOut, &s.InputTokens, &s.OutputTokens, &s.ChunkCount,
 		&s.CurrentRate, &s.AverageRate, &s.PeakRate, &s.EchoIntervalMS, &s.EchoContentMode,
-		&rate, &req, &s.ScenarioID, &s.FinishReason, &s.EndReason)
+		&rate, &req, &s.FinishReason, &s.EndReason)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +473,7 @@ func buildSessionQuery(f storage.SessionFilter, count bool) (string, []any) {
 		COALESCE(echo_count,0),COALESCE(bytes_in,0),COALESCE(bytes_out,0),COALESCE(input_tokens,0),
 		COALESCE(output_tokens,0),COALESCE(chunk_count,0),COALESCE(current_rate,0),COALESCE(average_rate,0),
 		COALESCE(peak_rate,0),COALESCE(echo_interval_ms,500),COALESCE(echo_content_mode,''),
-		COALESCE(rate_config,''),COALESCE(raw_request,''),COALESCE(scenario_id,''),COALESCE(finish_reason,''),COALESCE(end_reason,'')`
+		COALESCE(rate_config,''),COALESCE(raw_request,''),COALESCE(finish_reason,''),COALESCE(end_reason,'')`
 	}
 	var sb strings.Builder
 	var args []any
@@ -773,71 +797,6 @@ func (s *Store) DeleteKey(ctx context.Context, id string) error {
 
 func (s *Store) TouchKey(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET use_count=use_count+1,last_used_at=? WHERE id=?`, time.Now(), id)
-	return err
-}
-
-// ---------------- Scenarios ----------------
-
-func (s *Store) CreateScenario(ctx context.Context, sc *storage.Scenario) error {
-	steps, _ := json.Marshal(sc.Steps)
-	if sc.CreatedAt.IsZero() {
-		sc.CreatedAt = time.Now()
-	}
-	sc.UpdatedAt = time.Now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO scenarios (id,name,description,steps,created_at,updated_at) VALUES (?,?,?,?,?,?)`,
-		sc.ID, sc.Name, nullStr(sc.Description), string(steps), sc.CreatedAt, sc.UpdatedAt)
-	return err
-}
-
-func (s *Store) GetScenario(ctx context.Context, id string) (*storage.Scenario, error) {
-	var sc storage.Scenario
-	var steps string
-	var desc sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,description,steps,created_at,updated_at FROM scenarios WHERE id=?`, id).
-		Scan(&sc.ID, &sc.Name, &desc, &steps, &sc.CreatedAt, &sc.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	sc.Description = desc.String
-	if steps != "" {
-		_ = json.Unmarshal([]byte(steps), &sc.Steps)
-	}
-	return &sc, nil
-}
-
-func (s *Store) ListScenarios(ctx context.Context) ([]storage.Scenario, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,description,steps,created_at,updated_at FROM scenarios ORDER BY created_at DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []storage.Scenario
-	for rows.Next() {
-		var sc storage.Scenario
-		var steps string
-		var desc sql.NullString
-		if err := rows.Scan(&sc.ID, &sc.Name, &desc, &steps, &sc.CreatedAt, &sc.UpdatedAt); err != nil {
-			return nil, err
-		}
-		sc.Description = desc.String
-		if steps != "" {
-			_ = json.Unmarshal([]byte(steps), &sc.Steps)
-		}
-		out = append(out, sc)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) UpdateScenario(ctx context.Context, sc *storage.Scenario) error {
-	steps, _ := json.Marshal(sc.Steps)
-	sc.UpdatedAt = time.Now()
-	_, err := s.db.ExecContext(ctx, `UPDATE scenarios SET name=?,description=?,steps=?,updated_at=? WHERE id=?`,
-		sc.Name, nullStr(sc.Description), string(steps), sc.UpdatedAt, sc.ID)
-	return err
-}
-
-func (s *Store) DeleteScenario(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM scenarios WHERE id=?`, id)
 	return err
 }
 

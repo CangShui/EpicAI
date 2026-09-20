@@ -73,7 +73,19 @@ export function stateBadge(state) {
     ERROR_PENDING: 'orange', ENDING: 'gray', ENDED: 'gray',
     CLIENT_DISCONNECTED: 'gray', RESOURCE_LIMIT: 'red',
   };
-  return el('span', { class: 'badge ' + (map[state] || 'gray') }, state || '—');
+  const labelMap = {
+    CONNECTED: '已连接',
+    WAITING_FOR_SLOT: '排队中',
+    ECHOING: '回显中 (Echo)',
+    PAUSED: '已暂停',
+    MANUAL: '人工接管中',
+    ERROR_PENDING: '等待注入错误',
+    ENDING: '正在结束',
+    ENDED: '已结束',
+    CLIENT_DISCONNECTED: '客户端已断开',
+    RESOURCE_LIMIT: '触发资源限额',
+  };
+  return el('span', { class: 'badge ' + (map[state] || 'gray'), title: state }, labelMap[state] || state || '—');
 }
 
 export function escapeHtml(s) {

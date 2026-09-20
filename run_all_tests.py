@@ -31,6 +31,36 @@ def admin_login():
 
 token = admin_login()
 
+def ensure_model(payload):
+    """Create the model, or update it if it already exists (idempotent seed)."""
+    mid = payload["model_id"]
+    try:
+        admin_put(f"/admin/api/models/{mid}", payload)
+    except Exception:
+        try:
+            admin_post("/admin/api/models", payload)
+        except Exception:
+            pass
+
+def seed_fixtures():
+    """Seed the fixture models the acceptance suite relies on."""
+    # epic-alpha must remain a plain infinite echo model.
+    ensure_model({"model_id": "epic-alpha", "display_name": "Epic Alpha (Infinite Echo)",
+                  "behavior": "infinite_echo", "default_echo_interval_ms": 500,
+                  "enable_agent": False, "subagent_count": 0, "max_token_chunk": 0})
+    ensure_model({"model_id": "model-fast", "display_name": "Fast Echo",
+                  "behavior": "infinite_echo", "default_echo_interval_ms": 10})
+    ensure_model({"model_id": "test-fast-20", "display_name": "Fast 20",
+                  "behavior": "infinite_echo", "default_echo_interval_ms": 10})
+    ensure_model({"model_id": "test-fast-100", "display_name": "Fast 100",
+                  "behavior": "infinite_echo", "default_echo_interval_ms": 10})
+    for st in [400, 401, 403, 404, 429, 500, 502, 503, 504]:
+        ensure_model({"model_id": f"test-err-{st}", "display_name": f"Error {st}",
+                      "behavior": "immediate_error", "error_status": st})
+    ensure_model({"model_id": "test-err-6004", "display_name": "Error 6004",
+                  "behavior": "immediate_error", "error_status": 429, "error_code": "6004",
+                  "error_type": "rate_limit_error", "error_message": "您的使用量已超出频率限制"})
+
 def admin_get(path):
     req = urllib.request.Request(f"{BASE_URL}{path}", headers={"X-Admin-Token": token})
     with urllib.request.urlopen(req) as resp:
@@ -55,6 +85,8 @@ def admin_delete(path):
     req = urllib.request.Request(f"{BASE_URL}{path}", headers={"X-Admin-Token": token}, method="DELETE")
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+seed_fixtures()
 
 # -------------------------------------------------------------
 # T001 - T004
@@ -701,22 +733,28 @@ try:
 except Exception as e:
     record("T083", "Chunk Count Error", "FAIL", str(e))
 
-# T084 Malformed SSE
+# T084 Malformed SSE (via fault injection)
 try:
-    req = urllib.request.Request(f"{BASE_URL}/v1/chat/completions", data=json.dumps({"model": "model-malformed", "messages": [{"role": "user", "content": "M"}], "stream": True}).encode("utf-8"), headers={"Authorization": "Bearer test", "Content-Type": "application/json"})
+    req = urllib.request.Request(f"{BASE_URL}/v1/chat/completions", data=json.dumps({"model": "test-fast-20", "messages": [{"role": "user", "content": "M"}], "stream": True}).encode("utf-8"), headers={"Authorization": "Bearer test", "Content-Type": "application/json"})
     conn84 = urllib.request.urlopen(req)
+    sid84 = conn84.headers.get("X-Epic-Session-Id")
+    admin_post(f"/admin/api/sessions/{sid84}/control", {"action": "inject", "after_chunks": 10, "fault_mode": "malformed"})
     saw_bad = False
     c84 = 0
     while True:
         l = conn84.readline().decode("utf-8")
         if not l:
             break
-        if "chatcmpl_broken" in l:
-            saw_bad = True
         if "data: " in l:
             c84 += 1
+            try:
+                json.loads(l[6:].strip())
+            except Exception:
+                saw_bad = True
     conn84.close()
-    record("T084", "Malformed SSE", "PASS" if saw_bad else "FAIL", f"malformed SSE injected, server alive")
+    with urllib.request.urlopen(f"{BASE_URL}/health") as h:
+        alive = json.loads(h.read().decode("utf-8")).get("status") == "ok"
+    record("T084", "Malformed SSE", "PASS" if (saw_bad and alive) else "FAIL", f"malformed SSE injected, server alive={alive}")
 except Exception as e:
     record("T084", "Malformed SSE", "FAIL", str(e))
 
@@ -783,11 +821,65 @@ record("T131", "Raw SSE", "PASS", "ring buffer captures raw SSE frames verbatim"
 record("T132", "Admin Audit", "PASS", "actions (TAKEOVER, SEND, RETURN, INJECT) logged with admin and params")
 
 # -------------------------------------------------------------
-# T140 - T142 (Scenario)
+# T140 - T142 (Agent Echo & Infinite Echo MAX)
 # -------------------------------------------------------------
-record("T140", "Scenario", "PASS", "sequential execution of echo, wait, send_text, echo, disconnect")
-record("T141", "Scenario Loop", "PASS", "loop_count=0 loops forever")
-record("T142", "Scenario Error", "PASS", "scenario error terminates stream with error event")
+# T140 Infinite Echo MAX aggregation
+try:
+    ensure_model({"model_id": "t140-max", "display_name": "T140 MAX", "behavior": "infinite_echo_max", "max_token_chunk": 1000, "default_echo_interval_ms": 100})
+    req = urllib.request.Request(f"{BASE_URL}/v1/chat/completions",
+                                 data=json.dumps({"model": "t140-max", "messages": [{"role": "user", "content": "你好"}], "stream": False}).encode("utf-8"),
+                                 headers={"Authorization": "Bearer test", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        c = json.loads(r.read().decode("utf-8"))["choices"][0]["message"]["content"]
+    if len(c) > 500 and c.startswith("你好"):
+        record("T140", "Infinite Echo MAX", "PASS", f"aggregated {len(c)} chars")
+    else:
+        record("T140", "Infinite Echo MAX", "FAIL", f"len={len(c)}")
+except Exception as e:
+    record("T140", "Infinite Echo MAX", "FAIL", str(e))
+
+# T141 Agent tool-call echo with subagent count
+try:
+    ensure_model({"model_id": "t141-agent", "display_name": "T141 Agent", "behavior": "infinite_echo", "enable_agent": True, "subagent_count": 2, "default_echo_interval_ms": 100})
+    tools = [{"type": "function", "function": {"name": "task", "description": "run", "parameters": {"type": "object"}}},
+             {"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object"}}}]
+    req = urllib.request.Request(f"{BASE_URL}/v1/chat/completions",
+                                 data=json.dumps({"model": "t141-agent", "messages": [{"role": "user", "content": "agent test"}], "tools": tools, "stream": True}).encode("utf-8"),
+                                 headers={"Authorization": "Bearer test", "Content-Type": "application/json"})
+    tc_count = 0
+    with urllib.request.urlopen(req) as r:
+        for line in r:
+            l = line.decode("utf-8").strip()
+            if l.startswith("data: {"):
+                d = json.loads(l[6:])
+                tc = d["choices"][0]["delta"].get("tool_calls")
+                if tc:
+                    tc_count += len(tc)
+            elif l == "data: [DONE]":
+                break
+    if tc_count == 2:
+        record("T141", "Agent Subagent Echo", "PASS", f"received {tc_count} subagent tool calls")
+    else:
+        record("T141", "Agent Subagent Echo", "FAIL", f"tool_calls={tc_count}")
+except Exception as e:
+    record("T141", "Agent Subagent Echo", "FAIL", str(e))
+
+# T142 Agent shell command carries user input
+try:
+    tools = [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object"}}}]
+    req = urllib.request.Request(f"{BASE_URL}/v1/chat/completions",
+                                 data=json.dumps({"model": "t141-agent", "messages": [{"role": "user", "content": "UNIQUE_ECHO_STRING"}], "tools": tools, "stream": False}).encode("utf-8"),
+                                 headers={"Authorization": "Bearer test", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    tcs = d["choices"][0]["message"].get("tool_calls", [])
+    args = tcs[0]["function"]["arguments"] if tcs else ""
+    if "UNIQUE_ECHO_STRING" in args and "echo" in args:
+        record("T142", "Agent Shell Echo", "PASS", f"bash args carry user input")
+    else:
+        record("T142", "Agent Shell Echo", "FAIL", args[:80])
+except Exception as e:
+    record("T142", "Agent Shell Echo", "FAIL", str(e))
 
 # -------------------------------------------------------------
 # T150 - T151 (Docker)

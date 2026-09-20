@@ -141,8 +141,9 @@ func NewKeyID() string { return "key_" + uuid.NewString() }
 
 // AdminAuth verifies admin credentials using constant-time comparison.
 type AdminAuth struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time
+	mu         sync.RWMutex
+	sessions   map[string]time.Time
+	customPass string
 }
 
 func NewAdmin() *AdminAuth {
@@ -151,8 +152,15 @@ func NewAdmin() *AdminAuth {
 
 func (a *AdminAuth) Login(user, pass string) (string, bool) {
 	cfg := config.C().Static()
+	expectedPass := cfg.AdminPassword
+	a.mu.RLock()
+	if a.customPass != "" {
+		expectedPass = a.customPass
+	}
+	a.mu.RUnlock()
+
 	okUser := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AdminUser)) == 1
-	okPass := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AdminPassword)) == 1
+	okPass := subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) == 1
 	if !okUser || !okPass {
 		return "", false
 	}
@@ -163,6 +171,12 @@ func (a *AdminAuth) Login(user, pass string) (string, bool) {
 	a.sessions[token] = time.Now().Add(12 * time.Hour)
 	a.mu.Unlock()
 	return token, true
+}
+
+func (a *AdminAuth) SetPassword(newPass string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.customPass = newPass
 }
 
 func (a *AdminAuth) Valid(token string) bool {

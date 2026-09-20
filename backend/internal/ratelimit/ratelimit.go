@@ -200,13 +200,15 @@ func (sb *SessionBucket) Account(tokens int) {
 	}
 	sb.mu.Lock()
 	sb.sent += int64(tokens)
-	sb.cur = float64(tokens)
-	rate := sb.calcRateLocked()
+	rate := sb.calcRateLocked(float64(tokens))
 	sb.cur = rate
 	if rate > sb.peak {
 		sb.peak = rate
 	}
-	sb.avg = float64(sb.sent) / time.Since(sb.startedAt).Seconds()
+	dur := time.Since(sb.startedAt).Seconds()
+	if dur > 0 {
+		sb.avg = float64(sb.sent) / dur
+	}
 	sb.mu.Unlock()
 
 	l := global()
@@ -215,9 +217,9 @@ func (sb *SessionBucket) Account(tokens int) {
 	}
 }
 
-func (sb *SessionBucket) calcRateLocked() float64 {
+func (sb *SessionBucket) calcRateLocked(newTok float64) float64 {
 	now := time.Now()
-	sb.recent = append(sb.recent, tokSample{now, sb.cur})
+	sb.recent = append(sb.recent, tokSample{now, newTok})
 	cut := now.Add(-2 * time.Second)
 	i := 0
 	for ; i < len(sb.recent); i++ {
@@ -228,7 +230,7 @@ func (sb *SessionBucket) calcRateLocked() float64 {
 	if i > 0 {
 		sb.recent = sb.recent[i:]
 	}
-	if len(sb.recent) < 2 {
+	if len(sb.recent) == 0 {
 		return 0
 	}
 	var sum float64
@@ -236,8 +238,8 @@ func (sb *SessionBucket) calcRateLocked() float64 {
 		sum += s.tok
 	}
 	span := now.Sub(sb.recent[0].at).Seconds()
-	if span <= 0 {
-		return 0
+	if span < 0.2 {
+		span = 0.2
 	}
 	return sum / span
 }

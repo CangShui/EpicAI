@@ -1,0 +1,1688 @@
+# EpicAI 项目验收测试书
+
+## 1. 测试目的
+
+验证 EpicAI 是否具备：
+
+* OpenAI API 基础兼容性
+* Chat Completions Streaming
+* Responses API Streaming
+* Infinite Echo
+* 多模态输入
+* 文件管理
+* 会话实时管理
+* 人工接管
+* 故障注入
+* 自定义错误
+* 网络异常模拟
+* 模型动态管理
+* 长连接稳定性
+* 资源保护
+
+---
+
+# 2. 验收原则
+
+测试结果分：
+
+```text
+PASS
+FAIL
+PARTIAL
+BLOCKED
+```
+
+任何 P0 测试存在 FAIL：
+
+> EpicAI 不允许判定为 MVP 完成。
+
+施工方必须提供实际：
+
+* curl 输出
+* 自动测试结果
+* API Response
+* 浏览器后台截图或录屏
+* 必要的服务日志
+
+不能仅用文字声明“已经完成”。
+
+---
+
+# 3. T001 Health
+
+请求：
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+预期：
+
+```json
+{
+  "status": "ok"
+}
+```
+
+结果：
+
+```text
+PASS / FAIL
+```
+
+---
+
+# 4. T002 Models
+
+请求：
+
+```bash
+curl http://127.0.0.1:8000/v1/models \
+  -H "Authorization: Bearer test"
+```
+
+必须至少包含：
+
+```text
+epic-alpha
+```
+
+并符合 OpenAI 风格 Models List 结构。
+
+---
+
+# 5. T003 获取单模型
+
+请求：
+
+```http
+GET /v1/models/epic-alpha
+```
+
+预期：
+
+HTTP：
+
+```text
+200
+```
+
+model id：
+
+```text
+epic-alpha
+```
+
+---
+
+# 6. T004 不存在模型
+
+请求模型：
+
+```text
+model-does-not-exist
+```
+
+预期：
+
+可配置为：
+
+```text
+404 model_not_found
+```
+
+错误 JSON 必须合法。
+
+---
+
+# 7. T010 Chat Completions 非流式
+
+请求：
+
+```json
+{
+  "model": "epic-alpha",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello epic"
+    }
+  ],
+  "stream": false
+}
+```
+
+Strict Mode 下预期：
+
+```text
+HTTP 200
+```
+
+assistant：
+
+```text
+hello epic
+```
+
+---
+
+# 8. T011 Chat Completions Streaming
+
+请求：
+
+```json
+{
+  "model": "epic-alpha",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ABC"
+    }
+  ],
+  "stream": true
+}
+```
+
+预期持续收到：
+
+```text
+ABC
+ABC
+ABC
+ABC
+...
+```
+
+持续 30 秒以上仍不得自然结束。
+
+PASS 条件：
+
+```text
+>= 30 秒
+>= 20 个 Echo
+没有 [DONE]
+```
+
+---
+
+# 9. T012 客户端主动取消
+
+保持 Infinite Echo。
+
+客户端主动：
+
+```text
+Ctrl+C
+```
+
+或 AbortController cancel。
+
+预期：
+
+服务器在合理时间内发现：
+
+```text
+CLIENT_DISCONNECTED
+```
+
+并释放该连接对应的 streaming task。
+
+不得产生 Zombie Session 持续发送。
+
+---
+
+# 10. T013 Echo 顺序正确
+
+输入：
+
+```text
+测试123 ABC !@#
+```
+
+连续捕获 100 个 Echo。
+
+每个 Echo 内容必须完全一致。
+
+不得出现：
+
+* 内容改变
+* 自动回答
+* AI 解释
+* 自动翻译
+* 自动总结
+
+---
+
+# 11. T014 Unicode
+
+测试：
+
+```text
+中文
+English
+日本語
+한국어
+😀
+𠮷
+换行
+Tab
+特殊字符
+```
+
+必须 UTF-8 正常往返。
+
+---
+
+# 12. T015 大文本
+
+输入：
+
+```text
+1 MB 文本
+```
+
+若处于允许范围：
+
+必须正常 Echo。
+
+如果超过后台限制：
+
+必须得到规定的：
+
+```text
+413
+```
+
+不得服务崩溃。
+
+---
+
+# 13. T020 Responses API
+
+请求：
+
+```json
+{
+  "model": "epic-alpha",
+  "input": "Responses Test",
+  "stream": true
+}
+```
+
+必须建立 SSE。
+
+持续返回：
+
+```text
+Responses Test
+```
+
+---
+
+# 14. T021 Responses Structured Input
+
+输入：
+
+```json
+{
+  "model": "epic-alpha",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Structured Test"
+        }
+      ]
+    }
+  ],
+  "stream": true
+}
+```
+
+必须能够正确解析。
+
+---
+
+# 15. T022 Chat 和 Responses Session 区分
+
+同时创建：
+
+```text
+Chat Completions Session
+Responses Session
+```
+
+后台必须显示正确：
+
+```text
+Protocol
+```
+
+不能全部显示成同一协议。
+
+---
+
+# 16. T030 图片 URL
+
+发送：
+
+```text
+text + image URL
+```
+
+后台必须：
+
+* 识别 text
+* 识别 image
+* 保存原始 content parts
+
+不得只留下文字。
+
+---
+
+# 17. T031 Base64 图片
+
+发送小型 PNG：
+
+```text
+data:image/png;base64,...
+```
+
+系统必须：
+
+* 成功接收
+* 不破坏 JSON
+* 可在后台预览或识别为 Asset
+* Echo 时引用正确 Asset
+
+---
+
+# 18. T032 多图片
+
+发送：
+
+```text
+图片 A
+图片 B
+图片 C
+```
+
+必须保留：
+
+```text
+A → B → C
+```
+
+顺序。
+
+---
+
+# 19. T033 文字 + 图片
+
+输入顺序：
+
+```text
+文字1
+图片1
+文字2
+图片2
+```
+
+Canonical Message 中顺序必须一致。
+
+---
+
+# 20. T034 文件上传
+
+调用：
+
+```http
+POST /v1/files
+```
+
+上传：
+
+```text
+test.txt
+```
+
+必须获得：
+
+```text
+file_epic_xxx
+```
+
+---
+
+# 21. T035 获取文件
+
+```http
+GET /v1/files/{id}
+```
+
+必须返回正确：
+
+```text
+filename
+bytes
+created_at
+id
+```
+
+---
+
+# 22. T036 下载文件
+
+调用：
+
+```http
+GET /v1/files/{id}/content
+```
+
+下载内容 SHA256 必须与上传前一致。
+
+---
+
+# 23. T037 混合多模态
+
+发送：
+
+```text
+文字
++
+图片
++
+PDF
++
+TXT
++
+图片
+```
+
+后台必须完整看到五个 content parts。
+
+---
+
+# 24. T040 后台实时出现 Session
+
+发起 Infinite Echo。
+
+浏览：
+
+```text
+/sessions
+```
+
+5 秒内必须出现该 Session。
+
+显示至少：
+
+```text
+session id
+model
+protocol
+state
+start time
+client
+```
+
+---
+
+# 25. T041 Session 实时统计
+
+Echo 持续时：
+
+```text
+Echo Count
+Bytes Out
+Duration
+```
+
+必须持续变化。
+
+---
+
+# 26. T042 防止管理页面卡死
+
+让一个 Session：
+
+```text
+echo >= 100,000 次
+```
+
+后台页面不得：
+
+* 浏览器崩溃
+* DOM 无限增长
+* 页面无法操作
+
+必须通过分页或 Virtual List 控制。
+
+---
+
+# 27. T050 Pause
+
+Infinite Echo 运行时点击：
+
+```text
+PAUSE
+```
+
+预期：
+
+客户端不再收到新的 Echo。
+
+但：
+
+```text
+connection remains open
+```
+
+Session：
+
+```text
+PAUSED
+```
+
+---
+
+# 28. T051 Resume
+
+PAUSE 后点击：
+
+```text
+RESUME
+```
+
+Echo 应继续。
+
+无需客户端重新连接。
+
+---
+
+# 29. T052 Manual Takeover
+
+Echo 运行时点击：
+
+```text
+TAKE OVER
+```
+
+预期：
+
+Echo 停止。
+
+State：
+
+```text
+MANUAL
+```
+
+---
+
+# 30. T053 人工消息
+
+管理员输入：
+
+```text
+这是一条人工发送的信息
+```
+
+客户端必须收到：
+
+```text
+这是一条人工发送的信息
+```
+
+内容不得经过 Echo Engine 修改。
+
+---
+
+# 31. T054 连续人工发送
+
+依次发送：
+
+```text
+AAAA
+BBBB
+CCCC
+```
+
+客户端必须按相同顺序收到。
+
+---
+
+# 32. T055 Return to Echo
+
+点击：
+
+```text
+RETURN TO ECHO
+```
+
+状态：
+
+```text
+MANUAL → ECHOING
+```
+
+之后自动 Echo 恢复。
+
+---
+
+# 33. T056 模拟人工打字
+
+配置：
+
+```text
+10 chars/sec
+```
+
+发送：
+
+```text
+12345678901234567890
+```
+
+客户端应观察到流式逐渐出现。
+
+发送过程约符合设定速率。
+
+---
+
+# 34. T060 正常 Finish
+
+Streaming 中点击：
+
+```text
+FINISH NORMALLY
+```
+
+Chat Completions 必须正常：
+
+```text
+finish_reason
+[DONE]
+```
+
+客户端认为请求正常完成。
+
+---
+
+# 35. T061 Drop Connection
+
+点击：
+
+```text
+DROP CONNECTION
+```
+
+不得正常发 `[DONE]`。
+
+客户端应该观察到类似：
+
+```text
+unexpected EOF
+connection closed
+stream interrupted
+```
+
+实际文案由客户端决定。
+
+---
+
+# 36. T070 400
+
+管理员 Inject：
+
+```text
+400
+```
+
+Body：
+
+```json
+{
+  "error": {
+    "message": "Bad request",
+    "type": "invalid_request_error",
+    "code": "bad_request"
+  }
+}
+```
+
+客户端必须实际收到 HTTP 400。
+
+---
+
+# 37. T071 401
+
+注入：
+
+```text
+401
+```
+
+必须实际返回 HTTP 401。
+
+---
+
+# 38. T072 403
+
+注入：
+
+```text
+403
+```
+
+必须实际返回 HTTP 403。
+
+---
+
+# 39. T073 404
+
+注入：
+
+```text
+404 model_not_found
+```
+
+验证 HTTP 状态和 JSON。
+
+---
+
+# 40. T074 429
+
+输入：
+
+```text
+HTTP = 429
+type = rate_limit_error
+code = rate_limit_exceeded
+message = Rate limit exceeded
+```
+
+客户端必须得到 HTTP 429。
+
+---
+
+# 41. T075 自定义 429/6004
+
+配置：
+
+```text
+HTTP status = 429
+
+code = 6004
+
+message =
+您的使用量已超出频率限制
+```
+
+预期：
+
+HTTP 必须：
+
+```text
+429
+```
+
+JSON 必须包含：
+
+```text
+6004
+```
+
+和完整中文信息。
+
+---
+
+# 42. T076 Raw JSON
+
+输入：
+
+```json
+{
+  "code": 429,
+  "message": "upstream 429",
+  "payload": {
+    "code": 6004,
+    "msg": "quota exhausted"
+  }
+}
+```
+
+选择：
+
+```text
+RAW RESPONSE
+```
+
+客户端收到的 JSON 不得被系统自动包装或修改。
+
+---
+
+# 43. T077 500
+
+注入：
+
+```text
+500 Internal Server Error
+```
+
+服务器本身不得因此：
+
+* crash
+* restart
+* 抛未处理异常
+
+故障只是当前测试 Session 的模拟结果。
+
+---
+
+# 44. T078 502
+
+验证：
+
+```text
+HTTP 502
+```
+
+---
+
+# 45. T079 503
+
+验证：
+
+```text
+HTTP 503
+```
+
+---
+
+# 46. T080 504
+
+验证：
+
+```text
+HTTP 504
+```
+
+---
+
+# 47. T081 流输出后异常
+
+设置：
+
+```text
+Echo 20 chunks
+then disconnect
+```
+
+验证：
+
+前 20 chunk 正常。
+
+第 21 步连接异常中止。
+
+---
+
+# 48. T082 Delayed Error
+
+设置：
+
+```text
+10 秒后返回错误
+```
+
+请求开始后：
+
+前 10 秒连接保持。
+
+之后出现设定错误。
+
+误差应控制在合理范围。
+
+---
+
+# 49. T083 Chunk Count Error
+
+配置：
+
+```text
+100 chunks → error
+```
+
+客户端精确接收约定数量后触发错误。
+
+计数规则必须在文档定义清楚。
+
+---
+
+# 50. T084 Malformed SSE
+
+Scenario：
+
+```text
+10 个合法 Chunk
+1 个非法 JSON Chunk
+关闭连接
+```
+
+验证 EpicAI 能制造协议错误，但服务器本身保持正常运行。
+
+---
+
+# 51. T090 Model 新增
+
+后台增加：
+
+```text
+test-model-123
+```
+
+再次：
+
+```http
+GET /v1/models
+```
+
+无需重启服务即可看到。
+
+---
+
+# 52. T091 禁用模型
+
+禁用：
+
+```text
+test-model-123
+```
+
+Models List 不再显示。
+
+向它发请求：
+
+必须得到后台配置的：
+
+```text
+404
+```
+
+或对应 disabled error。
+
+---
+
+# 53. T092 修改模型行为
+
+把：
+
+```text
+test-model-123
+```
+
+从：
+
+```text
+Infinite Echo
+```
+
+改为：
+
+```text
+Immediate 503
+```
+
+下一次请求必须直接得到 503。
+
+无需重启服务。
+
+---
+
+# 54. T093 同时多个模型
+
+创建：
+
+```text
+epic-alpha
+epic-beta
+gpt-5-test
+gemini-test
+```
+
+各模型可以绑定不同 Scenario。
+
+互不影响。
+
+---
+
+# 55. T100 API Key 任意模式
+
+启用：
+
+```text
+Accept Any Key
+```
+
+使用：
+
+```text
+Bearer abc
+Bearer 123
+Bearer sk-test
+```
+
+均允许进入。
+
+---
+
+# 56. T101 Key 校验模式
+
+启用：
+
+```text
+Require Managed Key
+```
+
+未知 Key：
+
+```text
+401
+```
+
+合法 Key：
+
+```text
+200
+```
+
+---
+
+# 57. T102 API Key 日志脱敏
+
+后台不得显示：
+
+```text
+sk-abcdefghijklmnop
+```
+
+只能类似：
+
+```text
+sk-****mnop
+```
+
+或 fingerprint/hash。
+
+---
+
+# 58. T110 并发
+
+同时启动：
+
+```text
+100 个 Streaming Sessions
+```
+
+持续至少：
+
+```text
+5 分钟
+```
+
+要求：
+
+* Session 不串线
+* 内容不串线
+* 管理操作不串 Session
+* 一个 Session 失败不影响其他 Session
+
+具体性能上限根据运行硬件记录，不强行规定绝对 QPS。
+
+---
+
+# 59. T111 人工接管隔离
+
+创建：
+
+```text
+Session A
+Session B
+```
+
+接管：
+
+```text
+A
+```
+
+发送：
+
+```text
+ONLY-A
+```
+
+B 绝不能收到：
+
+```text
+ONLY-A
+```
+
+---
+
+# 60. T112 Error 隔离
+
+Session A 注入：
+
+```text
+429
+```
+
+Session B 必须继续正常 Echo。
+
+---
+
+# 61. T113 Model 隔离
+
+Model A：
+
+```text
+100ms Echo
+```
+
+Model B：
+
+```text
+2000ms Echo
+```
+
+两个 Session 必须按照各自策略执行。
+
+---
+
+# 62. T120 长连接
+
+保持一个 Infinite Echo：
+
+```text
+>= 1 小时
+```
+
+期间：
+
+* 服务不能退出
+* Session 不应自动完成
+* 后台仍然可以接管
+* Pause/Resume 仍然可用
+
+---
+
+# 63. T121 客户端反复断开
+
+循环：
+
+```text
+connect
+10 秒
+disconnect
+```
+
+执行：
+
+```text
+1000 次
+```
+
+检查：
+
+* Streaming task 数量不无限增长
+* 内存不持续不可回收增长
+* Session 可以正确结束
+
+---
+
+# 64. T122 文件存储保护
+
+上传超过：
+
+```text
+max_file_size
+```
+
+的文件。
+
+必须：
+
+```text
+拒绝
+```
+
+并返回定义好的错误。
+
+不得导致 OOM。
+
+---
+
+# 65. T123 Echo Rate 保护
+
+设置异常值：
+
+```text
+0ms Echo
+```
+
+运行压力测试。
+
+服务器必须有：
+
+* backpressure
+  或
+* rate protection
+
+不能产生失控 Busy Loop 将 CPU 永久打满。
+
+---
+
+# 66. T124 日志存储保护
+
+运行高频 Echo 大量 Session。
+
+确认：
+
+* UI 日志有限
+* 数据库有分页
+* retention 可设置
+* 不在内存无限保存全部 Chunk
+
+---
+
+# 67. T130 Raw Request Inspector
+
+后台：
+
+```text
+Raw Request
+```
+
+必须能看到完整：
+
+```text
+method
+path
+headers
+JSON body
+```
+
+Authorization 必须脱敏。
+
+---
+
+# 68. T131 Raw SSE
+
+后台：
+
+```text
+Raw SSE
+```
+
+必须能够查看实际发送给客户端的 SSE Event。
+
+至少允许查看最近 N 个。
+
+---
+
+# 69. T132 Admin Audit
+
+执行：
+
+```text
+TAKE OVER
+SEND
+RETURN
+INJECT ERROR
+```
+
+Audit Log 必须记录：
+
+```text
+管理员
+时间
+Session
+动作
+参数摘要
+```
+
+---
+
+# 70. T140 Scenario
+
+建立：
+
+```text
+test-scenario
+```
+
+步骤：
+
+```text
+Echo × 5
+Wait 2s
+Send "TEST"
+Echo × 5
+Disconnect
+```
+
+客户端观察顺序必须正确。
+
+---
+
+# 71. T141 Scenario Loop
+
+设置：
+
+```text
+loop forever
+```
+
+不得执行完一次后自然退出。
+
+---
+
+# 72. T142 Scenario Error
+
+配置：
+
+```text
+Echo × 50
+HTTP/Stream Error
+```
+
+验证 Scenario Engine 和手工 Error Injection 的行为一致。
+
+---
+
+# 73. T150 Docker
+
+全新环境执行：
+
+```bash
+docker compose up -d
+```
+
+不得要求人工进入容器修改源码。
+
+启动完成后：
+
+```text
+/health
+/admin
+/v1/models
+```
+
+均能访问。
+
+---
+
+# 74. T151 Docker Restart
+
+执行：
+
+```bash
+docker compose restart
+```
+
+确认：
+
+* 模型配置仍存在
+* Scenario 仍存在
+* API Keys 仍存在
+* 数据库未丢失
+
+正在运行的 Streaming Session 可以结束，这是允许的。
+
+---
+
+# 75. T160 OpenAI SDK 实测
+
+必须至少选择官方 OpenAI SDK 的一种语言进行真实测试，例如：
+
+```text
+Python
+```
+
+配置：
+
+```text
+base_url = EpicAI
+api_key = test
+model = epic-alpha
+```
+
+确认：
+
+```text
+Models
+Chat Completions
+Streaming
+Responses
+```
+
+可以正常调用。
+
+---
+
+# 76. T161 curl 实测
+
+必须提供完整 curl 测试。
+
+不能只依赖自行编写的 SDK。
+
+---
+
+# 77. T162 第三方客户端测试
+
+至少选择一个支持：
+
+```text
+Custom OpenAI Base URL
+```
+
+的客户端。
+
+验证：
+
+```text
+epic-alpha
+```
+
+可以显示在客户端并进行 Infinite Echo。
+
+此项为兼容性测试，不影响服务器核心协议验收。
+
+---
+
+# 78. 最核心综合测试
+
+建立一个真实客户端连接。
+
+客户端发送：
+
+```text
+EpicAI Test
+```
+
+确认持续：
+
+```text
+EpicAI Test
+EpicAI Test
+EpicAI Test
+...
+```
+
+然后管理员：
+
+```text
+PAUSE
+```
+
+确认客户端停止输出。
+
+然后：
+
+```text
+RESUME
+```
+
+确认恢复。
+
+然后：
+
+```text
+TAKE OVER
+```
+
+发送：
+
+```text
+ADMIN MESSAGE
+```
+
+确认客户端收到。
+
+然后：
+
+```text
+RETURN TO ECHO
+```
+
+确认再次出现：
+
+```text
+EpicAI Test
+EpicAI Test
+...
+```
+
+最后管理员：
+
+```text
+INJECT ERROR
+```
+
+设置：
+
+```text
+429
+6004
+您的使用量已超出频率限制
+```
+
+确认客户端最终观察到指定故障。
+
+整个过程中客户端不得重新建立会话。
+
+此测试：
+
+```text
+PASS
+```
+
+即代表 EpicAI 的主要设计目标已经实现。
+
+---
+
+# 79. MVP 强制通过项目
+
+以下测试全部属于 P0：
+
+```text
+T001
+T002
+T010
+T011
+T012
+T020
+T040
+T050
+T051
+T052
+T053
+T055
+T060
+T061
+T074
+T075
+T076
+T081
+T090
+T111
+T112
+T130
+T150
+T160
+T161
+核心综合测试
+```
+
+任意一个 FAIL：
+
+```text
+MVP = FAIL
+```
+
+---
+
+# 80. 最终验收报告格式
+
+施工 AI 最终必须输出：
+
+```text
+EpicAI Version:
+Git Commit:
+Build Date:
+Environment:
+
+Total Tests:
+PASS:
+FAIL:
+PARTIAL:
+BLOCKED:
+
+P0 PASS:
+P0 FAIL:
+
+Known Issues:
+1.
+2.
+3.
+
+Protocol Compatibility:
+Chat Completions:
+Responses:
+Models:
+Files:
+Streaming:
+Multimodal:
+
+Admin:
+Session Viewer:
+Manual Takeover:
+Fault Injection:
+Scenario Engine:
+
+Conclusion:
+PASS / FAIL
+```
+
+同时提交实际自动化测试日志。
+
+禁止仅回复：
+
+```text
+“项目已经完成，所有功能正常。”
+```
+
+必须提供可复现证据。
